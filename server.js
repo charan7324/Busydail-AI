@@ -24,10 +24,25 @@ const PORT = process.env.PORT || 5050;
 const GEMINI_WS_URL =
 `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=${GEMINI_API_KEY}`;
 
-const SYSTEM_MESSAGE =
-'You are a voice assistant. Keep responses short and natural.';
+const SYSTEM_MESSAGE = 'You are a voice assistant. Keep responses short.';
 
-/* ---------------- AUDIO CONVERSION ---------------- */
+/* ---------------- SAFE WS HELPERS ---------------- */
+
+function waitForOpen(ws) {
+    return new Promise((resolve) => {
+        if (ws.readyState === WebSocket.OPEN) return resolve();
+        ws.on('open', resolve);
+    });
+}
+
+async function safeSend(ws, data) {
+    if (ws.readyState !== WebSocket.OPEN) {
+        await waitForOpen(ws);
+    }
+    ws.send(JSON.stringify(data));
+}
+
+/* ---------------- AUDIO ---------------- */
 
 function mulawToLinear(u) {
     u = ~u & 0xFF;
@@ -110,19 +125,17 @@ fastify.register(async (fastify) => {
 
         let streamSid = null;
         let geminiReady = false;
-
         let transcript = [];
         let lastSpeechTime = Date.now();
         let callStart = Date.now();
-
         let ending = false;
 
         const geminiWs = new WebSocket(GEMINI_WS_URL);
 
         /* ---------- INIT ---------- */
 
-        geminiWs.on('open', () => {
-            geminiWs.send(JSON.stringify({
+        geminiWs.on('open', async () => {
+            await safeSend(geminiWs, {
                 setup: {
                     model: `models/${MODEL}`,
                     generation_config: {
@@ -137,10 +150,10 @@ fastify.register(async (fastify) => {
                         parts: [{ text: SYSTEM_MESSAGE }]
                     }
                 }
-            }));
+            });
         });
 
-        geminiWs.on('message', async (data) => {
+        geminiWs.on('message', (data) => {
             const msg = JSON.parse(data.toString());
 
             if (msg.setupComplete !== undefined) {
@@ -154,12 +167,10 @@ fastify.register(async (fastify) => {
             if (sc.modelTurn?.parts) {
                 for (const part of sc.modelTurn.parts) {
 
-                    // TEXT (AI OUTPUT)
                     if (part.text) {
                         console.log('AI:', part.text);
                     }
 
-                    // AUDIO
                     if (part.inlineData?.data) {
                         const mulaw = pcmToMulaw(part.inlineData.data);
 
@@ -173,39 +184,33 @@ fastify.register(async (fastify) => {
             }
         });
 
-        /* ---------- INTELLIGENT END DETECTION ---------- */
+        /* ---------- INTENT DETECTION ---------- */
 
         async function checkEndIntent(text) {
+            const tempWs = new WebSocket(GEMINI_WS_URL);
+            await waitForOpen(tempWs);
+
+            await safeSend(tempWs, {
+                setup: { model: "models/gemini-2.0-flash" }
+            });
+
+            await safeSend(tempWs, {
+                client_content: {
+                    turns: [{
+                        role: "user",
+                        parts: [{
+                            text: `User said: "${text}". Is the user ending the conversation? Answer YES or NO.`
+                        }]
+                    }],
+                    turn_complete: true
+                }
+            });
+
             return new Promise((resolve) => {
-
-                const tempWs = new WebSocket(GEMINI_WS_URL);
-
-                tempWs.on('open', () => {
-                    tempWs.send(JSON.stringify({
-                        setup: {
-                            model: "models/gemini-2.0-flash",
-                        }
-                    }));
-
-                    tempWs.send(JSON.stringify({
-                        client_content: {
-                            turns: [{
-                                role: "user",
-                                parts: [{
-                                    text: `User said: "${text}". Is the user ending the conversation? Answer YES or NO.`
-                                }]
-                            }],
-                            turn_complete: true
-                        }
-                    }));
-                });
-
                 tempWs.on('message', (d) => {
                     const m = JSON.parse(d.toString());
-
                     if (m.serverContent?.modelTurn?.parts) {
                         const txt = m.serverContent.modelTurn.parts[0]?.text || '';
-
                         resolve(txt.toLowerCase().includes('yes'));
                         tempWs.close();
                     }
@@ -216,34 +221,30 @@ fastify.register(async (fastify) => {
         /* ---------- SUMMARY ---------- */
 
         async function generateSummary() {
+            const tempWs = new WebSocket(GEMINI_WS_URL);
+            await waitForOpen(tempWs);
+
+            await safeSend(tempWs, {
+                setup: { model: "models/gemini-2.0-flash" }
+            });
+
+            await safeSend(tempWs, {
+                client_content: {
+                    turns: [{
+                        role: "user",
+                        parts: [{
+                            text: `Summarize this conversation:\n${transcript.join('\n')}`
+                        }]
+                    }],
+                    turn_complete: true
+                }
+            });
+
             return new Promise((resolve) => {
-
-                const tempWs = new WebSocket(GEMINI_WS_URL);
-
-                tempWs.on('open', () => {
-                    tempWs.send(JSON.stringify({
-                        setup: { model: "models/gemini-2.0-flash" }
-                    }));
-
-                    tempWs.send(JSON.stringify({
-                        client_content: {
-                            turns: [{
-                                role: "user",
-                                parts: [{
-                                    text: `Summarize this conversation:\n${transcript.join('\n')}`
-                                }]
-                            }],
-                            turn_complete: true
-                        }
-                    }));
-                });
-
                 tempWs.on('message', (d) => {
                     const m = JSON.parse(d.toString());
-
                     if (m.serverContent?.modelTurn?.parts) {
-                        const summary = m.serverContent.modelTurn.parts[0]?.text;
-                        console.log('\n📊 SUMMARY:\n', summary);
+                        console.log('\n📊 SUMMARY:\n', m.serverContent.modelTurn.parts[0]?.text);
                         resolve();
                         tempWs.close();
                     }
@@ -266,7 +267,6 @@ fastify.register(async (fastify) => {
 
                     if (ending) return;
 
-                    // ⏱ max time
                     if (Date.now() - callStart > 120000) {
                         ending = true;
                         await generateSummary();
@@ -278,29 +278,27 @@ fastify.register(async (fastify) => {
 
                     const pcm = mulawToPCM16(data.media.payload);
 
-                    geminiWs.send(JSON.stringify({
-                        realtime_input: {
-                            media_chunks: [{
-                                data: pcm,
-                                mime_type: 'audio/pcm;rate=16000'
-                            }]
-                        }
-                    }));
+                    if (geminiReady) {
+                        await safeSend(geminiWs, {
+                            realtime_input: {
+                                media_chunks: [{
+                                    data: pcm,
+                                    mime_type: 'audio/pcm;rate=16000'
+                                }]
+                            }
+                        });
+                    }
 
                     break;
             }
         });
 
-        /* ---------- SILENCE DETECTION ---------- */
+        /* ---------- SILENCE ---------- */
 
-        const silenceInterval = setInterval(async () => {
+        const interval = setInterval(async () => {
             if (ending) return;
 
-            const silence = Date.now() - lastSpeechTime;
-
-            if (silence > 8000) {
-                console.log('Silence detected');
-
+            if (Date.now() - lastSpeechTime > 8000) {
                 ending = true;
                 await generateSummary();
                 connection.close();
@@ -308,10 +306,8 @@ fastify.register(async (fastify) => {
         }, 2000);
 
         connection.on('close', () => {
-            clearInterval(silenceInterval);
-            if (geminiWs.readyState === WebSocket.OPEN) {
-                geminiWs.close();
-            }
+            clearInterval(interval);
+            if (geminiWs.readyState === WebSocket.OPEN) geminiWs.close();
         });
     });
 });
