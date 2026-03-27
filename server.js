@@ -47,10 +47,16 @@ Follow these strict behaviour rules:
 7. Handle conversation naturally:
 * If user is silent: "hello... are you there?"
 * If user interrupts: "okay sorry, go ahead"
-* If ending: "okay then, I'll disconnect"
-8. Do NOT sound like a chatbot, formal assistant, or scripted/robotic
-9. Avoid complex vocabulary, long explanations, structured or essay-style responses
-10. Always prioritise: natural flow > correctness > completeness
+* If ending call naturally: say a casual warm goodbye like "okay then, talk to you later, bye bye!" and append [END_CALL] at the very end of your TEXT response (not spoken)
+* If you receive an internal instruction to end the call due to time: naturally say something like "okay so actually I have to rush now, I'll call you back later okay? bye!" or "hmm okay I need to go now, will talk later, bye bye!" — keep it very casual and human, do NOT mention time or limits, and append [END_CALL] at the very end of your TEXT response (not spoken)
+8. IMPORTANT - End call detection: If the user says anything that means they want to end the call — directly or indirectly — such as:
+* Direct: "bye", "goodbye", "ok bye", "take care", "talk later", "disconnect", "end call"
+* Indirect: "I'll let you go", "we'll talk later", "okay that's it", "I think we're done", "nothing else", "that's all", "okay fine", "alright then", "I have to go", "I'm busy now", "call me later", "I'll call you back"
+* In any language mix or casual phrasing
+Then: respond with a natural warm Indian goodbye, and always append [END_CALL] at the very end of your text response. The [END_CALL] tag will never be spoken — it is only a signal.
+9. Do NOT sound like a chatbot, formal assistant, or scripted/robotic
+10. Avoid complex vocabulary, long explanations, structured or essay-style responses
+11. Always prioritise: natural flow > correctness > completeness
 Your speech should feel like a real Indian person talking casually on a phone call.`;
 
 // Gemini Live API model name
@@ -60,6 +66,9 @@ const MODEL = 'gemini-2.5-flash-native-audio-preview-12-2025';
 const VOICE = 'Aoede';
 
 const PORT = process.env.PORT || 5050;
+
+// Maximum call duration in milliseconds (2 minutes)
+const MAX_CALL_DURATION_MS = 2 * 60 * 1000;
 
 // Gemini Live API WebSocket endpoint
 const GEMINI_WS_URL =
@@ -162,6 +171,9 @@ fastify.get('/', async (request, reply) => {
 fastify.all('/incoming-call', async (request, reply) => {
     const twimlResponse = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
+    <Say voice="Google.en-US-Chirp3-HD-Aoede">Please wait while we connect your call to the A.I. voice assistant, powered by Twilio and the Gemini Live API.</Say>
+    <Pause length="1"/>
+    <Say voice="Google.en-US-Chirp3-HD-Aoede">O.K. you can start talking!</Say>
     <Connect>
         <Stream url="wss://${request.headers.host}/media-stream" />
     </Connect>
@@ -182,8 +194,48 @@ fastify.register(async (fastify) => {
         let responseStartTimestampTwilio = null;
         let lastAssistantMark = null;
         let geminiReady = false;
+        let callEnded = false;
+        let callTimer = null;
+        let accumulatedText = ''; // accumulates Gemini text to detect [END_CALL]
 
-        // ── Open Gemini Live API WebSocket ──
+        // ── End the call gracefully ──
+        const endCall = (reason = 'timeout') => {
+            if (callEnded) return;
+            callEnded = true;
+
+            if (callTimer) {
+                clearTimeout(callTimer);
+                callTimer = null;
+            }
+
+            console.log(`Ending call. Reason: ${reason}`);
+
+            // If timeout, ask Gemini to say a natural goodbye first
+            if (reason === 'timeout' && geminiWs.readyState === WebSocket.OPEN && geminiReady) {
+                const goodbyeMsg = {
+                    client_content: {
+                        turns: [{
+                            role: 'user',
+                            parts: [{
+                                text: '[INTERNAL INSTRUCTION - DO NOT READ ALOUD] End the call now naturally as an Indian caller who suddenly needs to leave. Keep it very short, casual, and human. Do not mention time limits.'
+                            }]
+                        }],
+                        turn_complete: true
+                    }
+                };
+                geminiWs.send(JSON.stringify(goodbyeMsg));
+
+                // Give Gemini 5 seconds to say goodbye, then close
+                setTimeout(() => {
+                    if (connection.readyState === WebSocket.OPEN) connection.close();
+                    if (geminiWs.readyState === WebSocket.OPEN) geminiWs.close();
+                }, 5000);
+
+            } else {
+                if (connection.readyState === WebSocket.OPEN) connection.close();
+                if (geminiWs.readyState === WebSocket.OPEN) geminiWs.close();
+            }
+        };
         const geminiWs = new WebSocket(GEMINI_WS_URL);
 
         // ── Initialise Gemini session after connection ──
@@ -274,7 +326,6 @@ fastify.register(async (fastify) => {
                 if (msg.setupComplete !== undefined) {
                     console.log('Gemini session ready');
                     geminiReady = true;
-                    // Uncomment the next line to have Gemini speak first:
                     sendInitialGreeting();
                     return;
                 }
@@ -293,6 +344,17 @@ fastify.register(async (fastify) => {
                     // Audio data from Gemini (PCM 24kHz) → convert → send to Twilio (mulaw 8kHz)
                     if (sc.modelTurn && sc.modelTurn.parts) {
                         for (const part of sc.modelTurn.parts) {
+
+                            // Accumulate text parts to detect [END_CALL] signal
+                            if (part.text) {
+                                accumulatedText += part.text;
+                                if (accumulatedText.includes('[END_CALL]')) {
+                                    console.log('End call intent detected in Gemini response');
+                                    // Give audio time to finish playing (~3 sec) then end
+                                    setTimeout(() => endCall('user_intent'), 3000);
+                                }
+                            }
+
                             if (part.inlineData && part.inlineData.data) {
                                 const mimeType = part.inlineData.mimeType || '';
 
@@ -320,6 +382,7 @@ fastify.register(async (fastify) => {
                     // Turn complete: Gemini finished speaking
                     if (sc.turnComplete) {
                         console.log('Gemini turn complete');
+                        accumulatedText = ''; // reset for next turn
                     }
                 }
 
@@ -339,6 +402,12 @@ fastify.register(async (fastify) => {
                         console.log('Stream started:', streamSid);
                         responseStartTimestampTwilio = null;
                         latestMediaTimestamp = 0;
+
+                        // Start 2-minute call limit timer
+                        callTimer = setTimeout(() => {
+                            console.log('Call duration limit reached');
+                            endCall('timeout');
+                        }, MAX_CALL_DURATION_MS);
                         break;
 
                     case 'media':
@@ -368,6 +437,7 @@ fastify.register(async (fastify) => {
 
                     case 'stop':
                         console.log('Stream stopped by Twilio');
+                        endCall('caller_hung_up');
                         break;
 
                     default:
@@ -382,7 +452,7 @@ fastify.register(async (fastify) => {
         // ── Cleanup ──
         connection.on('close', () => {
             console.log('Twilio client disconnected');
-            if (geminiWs.readyState === WebSocket.OPEN) geminiWs.close();
+            endCall('connection_closed');
         });
 
         geminiWs.on('close', (code, reason) => {
