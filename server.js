@@ -171,6 +171,9 @@ fastify.get('/', async (request, reply) => {
 fastify.all('/incoming-call', async (request, reply) => {
     const twimlResponse = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
+    <Say voice="Google.en-US-Chirp3-HD-Aoede">Please wait while we connect your call to the A.I. voice assistant, powered by Twilio and the Gemini Live API.</Say>
+    <Pause length="1"/>
+    <Say voice="Google.en-US-Chirp3-HD-Aoede">O.K. you can start talking!</Say>
     <Connect>
         <Stream url="wss://${request.headers.host}/media-stream" />
     </Connect>
@@ -197,8 +200,7 @@ fastify.register(async (fastify) => {
 
         // ── End the call gracefully ──
         const endCall = (reason = 'timeout') => {
-            if (callEnded) return;
-            callEnded = true;
+            if (callEnded && reason !== 'timeout' && reason !== 'caller_hung_up') return;
 
             if (callTimer) {
                 clearTimeout(callTimer);
@@ -209,26 +211,23 @@ fastify.register(async (fastify) => {
 
             // If timeout, ask Gemini to say a natural goodbye first
             if (reason === 'timeout' && geminiWs.readyState === WebSocket.OPEN && geminiReady) {
+                callEnded = true;
                 const goodbyeMsg = {
                     client_content: {
                         turns: [{
                             role: 'user',
                             parts: [{
-                                text: '[INTERNAL INSTRUCTION - DO NOT READ ALOUD] End the call now naturally as an Indian caller who suddenly needs to leave. Keep it very short, casual, and human. Do not mention time limits.'
+                                text: '[INTERNAL INSTRUCTION - DO NOT READ ALOUD] End the call now naturally as an Indian caller who suddenly needs to leave. Keep it very short, casual, and human. Do not mention time limits. Append [END_CALL] at the end of your text response.'
                             }]
                         }],
                         turn_complete: true
                     }
                 };
                 geminiWs.send(JSON.stringify(goodbyeMsg));
-
-                // Give Gemini 5 seconds to say goodbye, then close
-                setTimeout(() => {
-                    if (connection.readyState === WebSocket.OPEN) connection.close();
-                    if (geminiWs.readyState === WebSocket.OPEN) geminiWs.close();
-                }, 5000);
+                // turnComplete handler will close the connection after audio finishes
 
             } else {
+                callEnded = true;
                 if (connection.readyState === WebSocket.OPEN) connection.close();
                 if (geminiWs.readyState === WebSocket.OPEN) geminiWs.close();
             }
@@ -347,8 +346,8 @@ fastify.register(async (fastify) => {
                                 accumulatedText += part.text;
                                 if (accumulatedText.includes('[END_CALL]')) {
                                     console.log('End call intent detected in Gemini response');
-                                    // Give audio time to finish playing (~3 sec) then end
-                                    setTimeout(() => endCall('user_intent'), 3000);
+                                    // Don't end yet — wait for turnComplete so audio finishes
+                                    callEnded = true; // flag it, actual cleanup on turnComplete
                                 }
                             }
 
@@ -379,6 +378,14 @@ fastify.register(async (fastify) => {
                     // Turn complete: Gemini finished speaking
                     if (sc.turnComplete) {
                         console.log('Gemini turn complete');
+                        // If END_CALL was flagged, now it's safe to end — audio is fully done
+                        if (callEnded) {
+                            console.log('Goodbye audio finished, ending call now');
+                            setTimeout(() => {
+                                if (connection.readyState === WebSocket.OPEN) connection.close();
+                                if (geminiWs.readyState === WebSocket.OPEN) geminiWs.close();
+                            }, 500); // tiny buffer just in case
+                        }
                         accumulatedText = ''; // reset for next turn
                     }
                 }
