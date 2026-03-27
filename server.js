@@ -237,13 +237,15 @@ fastify.register(async (fastify) => {
                 setup: {
                     model: `models/${MODEL}`,
                     generation_config: {
-                        response_modalities: ['AUDIO'],
-                        speech_config: {
-                            voice_config: {
-                                prebuilt_voice_config: { voice_name: VOICE }
-                            }
-                        }
-                    },
+    response_modalities: ['AUDIO'],
+    speech_config: {
+        voice_config: {
+            prebuilt_voice_config: { voice_name: VOICE }
+        }
+    }
+},
+input_audio_transcription: {},
+output_audio_transcription: {},
                     system_instruction: {
                         parts: [{ text: SYSTEM_MESSAGE }]
                     }
@@ -324,8 +326,19 @@ fastify.register(async (fastify) => {
                 }
 
                 // Audio response chunks from Gemini
-                if (msg.serverContent) {
-                    const sc = msg.serverContent;
+                // Audio response chunks from Gemini
+if (msg.serverContent) {
+    const sc = msg.serverContent;
+
+    // Input transcription (what the caller said)
+    if (sc.inputTranscription && sc.inputTranscription.text) {
+        console.log(`Caller said: "${sc.inputTranscription.text}"`);
+    }
+
+    // Output transcription (what Gemini said)
+    if (sc.outputTranscription && sc.outputTranscription.text) {
+        console.log(`Gemini said: "${sc.outputTranscription.text}"`);
+    }
 
                     // Barge-in: Gemini detected the caller spoke over it
                     if (sc.interrupted) {
