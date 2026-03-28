@@ -176,45 +176,53 @@ fastify.all('/incoming-call', async (request, reply) => {
 // ─── Outbound Call Route ──────────────────────────────────────────────────────
 
 fastify.post('/make-call', async (request, reply) => {
-    const { to } = request.body;
+    let { to } = request.body;
 
-    if (!to) {
-        return reply.status(400).send({ error: 'Missing "to" phone number' });
+    // Convert to array if it's just a single string
+    const numbers = Array.isArray(to) ? to : [to];
+
+    if (!numbers.length || !numbers[0]) {
+        return reply.status(400).send({ error: 'Missing "to" phone number(s)' });
     }
 
-    try {
-        const credentials = Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString('base64');
+    const credentials = Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString('base64');
 
-        const response = await fetch(
-            `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Calls.json`,
-            {
-                method: 'POST',
-                headers: {
-                    'Authorization': `Basic ${credentials}`,
-                    'Content-Type': 'application/x-www-form-urlencoded'
-                },
-                body: new URLSearchParams({
-                    To: to,
-                    From: TWILIO_PHONE_NUMBER,
-                    Url: `https://${request.headers.host}/incoming-call`
-                }).toString()
+    // Create a list of promises for each call
+    const callPromises = numbers.map(async (phoneNumber) => {
+        try {
+            const response = await fetch(
+                `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Calls.json`,
+                {
+                    method: 'POST',
+                    headers: {
+                        'Authorization': `Basic ${credentials}`,
+                        'Content-Type': 'application/x-www-form-urlencoded'
+                    },
+                    body: new URLSearchParams({
+                        To: phoneNumber,
+                        From: TWILIO_PHONE_NUMBER,
+                        Url: `https://${request.headers.host}/incoming-call`
+                    }).toString()
+                }
+            );
+
+            const data = await response.json();
+            if (data.sid) {
+                return { success: true, number: phoneNumber, callSid: data.sid };
+            } else {
+                return { success: false, number: phoneNumber, error: data.message };
             }
-        );
-
-        const data = await response.json();
-
-        if (data.sid) {
-            console.log(`Outbound call initiated: ${data.sid} → ${to}`);
-            reply.send({ success: true, callSid: data.sid, to });
-        } else {
-            console.error('Twilio error:', data);
-            reply.status(500).send({ success: false, error: data.message || 'Failed to initiate call' });
+        } catch (err) {
+            return { success: false, number: phoneNumber, error: err.message };
         }
+    });
 
-    } catch (err) {
-        console.error('Error making outbound call:', err);
-        reply.status(500).send({ success: false, error: err.message });
-    }
+    // Fire them all off simultaneously
+    const results = await Promise.allSettled(callPromises);
+    
+    // Format the response for your CMD
+    const summary = results.map(r => r.value);
+    reply.send({ summary });
 });
 
 // ─── WebSocket: /media-stream ─────────────────────────────────────────────────
