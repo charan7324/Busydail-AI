@@ -7,10 +7,15 @@ import fastifyWs from '@fastify/websocket';
 // Load environment variables from .env file
 dotenv.config();
 
-const { GEMINI_API_KEY } = process.env;
+const { GEMINI_API_KEY, TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER } = process.env;
 
 if (!GEMINI_API_KEY) {
     console.error('Missing Gemini API key. Please set GEMINI_API_KEY in the .env file.');
+    process.exit(1);
+}
+
+if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !TWILIO_PHONE_NUMBER) {
+    console.error('Missing Twilio credentials. Please set TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER.');
     process.exit(1);
 }
 
@@ -80,8 +85,6 @@ const GEMINI_WS_URL =
 //  Twilio Media Streams use G.711 µ-law (mulaw) at 8 kHz.
 //  Gemini Live API expects raw PCM 16-bit LE at 16 kHz (input)
 //  and returns raw PCM 16-bit LE at 24 kHz (output).
-//
-//  We implement simple JS-native conversions to avoid native addon dependencies.
 
 /** Decode a single µ-law byte to a linear 16-bit PCM sample */
 function mulawToLinear(u) {
@@ -122,23 +125,17 @@ function linearToMulaw(sample) {
  */
 function mulawBase64ToPcm16Base64(mulawBase64) {
     const mulawBuf = Buffer.from(mulawBase64, 'base64');
-
-    // Decode µ-law → int16 at 8 kHz
     const pcm8k = new Int16Array(mulawBuf.length);
     for (let i = 0; i < mulawBuf.length; i++) {
         pcm8k[i] = mulawToLinear(mulawBuf[i]);
     }
-
-    // Upsample 8 kHz → 16 kHz (2× linear interpolation)
     const pcm16k = new Int16Array(pcm8k.length * 2);
     for (let i = 0; i < pcm8k.length - 1; i++) {
         pcm16k[i * 2]     = pcm8k[i];
         pcm16k[i * 2 + 1] = Math.round((pcm8k[i] + pcm8k[i + 1]) / 2);
     }
-    // Last sample
     pcm16k[(pcm8k.length - 1) * 2]     = pcm8k[pcm8k.length - 1];
     pcm16k[(pcm8k.length - 1) * 2 + 1] = pcm8k[pcm8k.length - 1];
-
     const out = Buffer.from(pcm16k.buffer);
     return out.toString('base64');
 }
@@ -150,24 +147,22 @@ function mulawBase64ToPcm16Base64(mulawBase64) {
 function pcm16Base64ToMulawBase64(pcm16Base64) {
     const pcmBuf = Buffer.from(pcm16Base64, 'base64');
     const pcm24k = new Int16Array(pcmBuf.buffer, pcmBuf.byteOffset, pcmBuf.byteLength / 2);
-
-    // Downsample 24 kHz → 8 kHz (keep every 3rd sample)
     const outLen = Math.floor(pcm24k.length / 3);
     const mulaw8k = Buffer.alloc(outLen);
     for (let i = 0; i < outLen; i++) {
         mulaw8k[i] = linearToMulaw(pcm24k[i * 3]);
     }
-
     return mulaw8k.toString('base64');
 }
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
 
+// Health check
 fastify.get('/', async (request, reply) => {
     reply.send({ message: 'Twilio + Gemini Live API Media Stream Server is running!' });
 });
 
-// TwiML for incoming calls
+// TwiML for incoming/outbound calls — connects directly to Gemini, no pre-recorded message
 fastify.all('/incoming-call', async (request, reply) => {
     const twimlResponse = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -176,6 +171,50 @@ fastify.all('/incoming-call', async (request, reply) => {
     </Connect>
 </Response>`;
     reply.type('text/xml').send(twimlResponse);
+});
+
+// ─── Outbound Call Route ──────────────────────────────────────────────────────
+
+fastify.post('/make-call', async (request, reply) => {
+    const { to } = request.body;
+
+    if (!to) {
+        return reply.status(400).send({ error: 'Missing "to" phone number' });
+    }
+
+    try {
+        const credentials = Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString('base64');
+
+        const response = await fetch(
+            `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Calls.json`,
+            {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Basic ${credentials}`,
+                    'Content-Type': 'application/x-www-form-urlencoded'
+                },
+                body: new URLSearchParams({
+                    To: to,
+                    From: TWILIO_PHONE_NUMBER,
+                    Url: `https://${request.headers.host}/incoming-call`
+                }).toString()
+            }
+        );
+
+        const data = await response.json();
+
+        if (data.sid) {
+            console.log(`Outbound call initiated: ${data.sid} → ${to}`);
+            reply.send({ success: true, callSid: data.sid, to });
+        } else {
+            console.error('Twilio error:', data);
+            reply.status(500).send({ success: false, error: data.message || 'Failed to initiate call' });
+        }
+
+    } catch (err) {
+        console.error('Error making outbound call:', err);
+        reply.status(500).send({ success: false, error: err.message });
+    }
 });
 
 // ─── WebSocket: /media-stream ─────────────────────────────────────────────────
@@ -193,7 +232,7 @@ fastify.register(async (fastify) => {
         let geminiReady = false;
         let callEnded = false;
         let callTimer = null;
-        let accumulatedText = ''; // accumulates Gemini text to detect [END_CALL]
+        let accumulatedText = '';
 
         // ── End the call gracefully ──
         const endCall = (reason = 'timeout') => {
@@ -206,7 +245,7 @@ fastify.register(async (fastify) => {
 
             console.log(`Ending call. Reason: ${reason}`);
 
-            // If timeout, ask Gemini to say a natural goodbye first
+            // If timeout → ask Gemini to say a natural goodbye first
             if (reason === 'timeout' && geminiWs.readyState === WebSocket.OPEN && geminiReady) {
                 callEnded = true;
                 const goodbyeMsg = {
@@ -221,7 +260,7 @@ fastify.register(async (fastify) => {
                     }
                 };
                 geminiWs.send(JSON.stringify(goodbyeMsg));
-                // turnComplete handler will close the connection after audio finishes
+                // turnComplete handler will close connection after audio finishes
 
             } else {
                 callEnded = true;
@@ -229,71 +268,66 @@ fastify.register(async (fastify) => {
                 if (geminiWs.readyState === WebSocket.OPEN) geminiWs.close();
             }
         };
+
+        // ── Open Gemini Live API WebSocket ──
         const geminiWs = new WebSocket(GEMINI_WS_URL);
 
-        // ── Initialise Gemini session after connection ──
+        // ── Initialise Gemini session ──
         const initializeGeminiSession = () => {
             const setupMsg = {
                 setup: {
                     model: `models/${MODEL}`,
                     generation_config: {
-    response_modalities: ['AUDIO'],
-    speech_config: {
-        voice_config: {
-            prebuilt_voice_config: { voice_name: VOICE }
-        }
-    }
-},
-input_audio_transcription: {},
-output_audio_transcription: {},
+                        response_modalities: ['AUDIO'],
+                        speech_config: {
+                            voice_config: {
+                                prebuilt_voice_config: { voice_name: VOICE }
+                            }
+                        }
+                    },
+                    input_audio_transcription: {},
+                    output_audio_transcription: {},
                     system_instruction: {
                         parts: [{ text: SYSTEM_MESSAGE }]
                     }
                 }
             };
-
             console.log('Sending Gemini setup message');
             geminiWs.send(JSON.stringify(setupMsg));
         };
 
-        // ── Optional: have Gemini greet the caller first ──
+        // ── Gemini greets the caller first ──
         const sendInitialGreeting = () => {
             const greetMsg = {
                 client_content: {
-                    turns: [
-                        {
-                            role: 'user',
-                            parts: [{
-                                text: 'Greet the user with a short, friendly welcome message and ask how you can help.'
-                            }]
-                        }
-                    ],
+                    turns: [{
+                        role: 'user',
+                        parts: [{
+                            text: 'Greet the user with a short, friendly welcome message and ask how you can help.'
+                        }]
+                    }],
                     turn_complete: true
                 }
             };
             geminiWs.send(JSON.stringify(greetMsg));
         };
 
-        // ── Handle barge-in / interruption from Gemini ──
+        // ── Handle barge-in / interruption ──
         const handleInterruption = () => {
             if (markQueue.length > 0 && responseStartTimestampTwilio != null) {
                 const elapsedTime = latestMediaTimestamp - responseStartTimestampTwilio;
                 console.log(`Interruption detected. Elapsed: ${elapsedTime}ms`);
-
-                // Tell Twilio to clear its audio buffer
                 connection.send(JSON.stringify({
                     event: 'clear',
                     streamSid: streamSid
                 }));
-
-                // Reset tracking state
                 markQueue = [];
                 lastAssistantMark = null;
                 responseStartTimestampTwilio = null;
             }
         };
 
-        // ── Send a mark event to Twilio so we can track playback ──
+        // ── Send mark to track Twilio playback ──
         const sendMark = () => {
             if (streamSid) {
                 const markEvent = {
@@ -317,7 +351,7 @@ output_audio_transcription: {},
             try {
                 const msg = JSON.parse(data.toString());
 
-                // Session is ready after setupComplete
+                // Session ready
                 if (msg.setupComplete !== undefined) {
                     console.log('Gemini session ready');
                     geminiReady = true;
@@ -325,78 +359,70 @@ output_audio_transcription: {},
                     return;
                 }
 
-                // Audio response chunks from Gemini
-                // Audio response chunks from Gemini
-if (msg.serverContent) {
-    const sc = msg.serverContent;
+                if (msg.serverContent) {
+                    const sc = msg.serverContent;
 
-    // Input transcription (what the caller said)
-    if (sc.inputTranscription && sc.inputTranscription.text) {
-        console.log(`Caller said: "${sc.inputTranscription.text}"`);
-    }
-
-    // Output transcription (what Gemini said)
-    if (sc.outputTranscription && sc.outputTranscription.text) {
-        console.log(`Gemini said: "${sc.outputTranscription.text}"`);
-    }
-
-                    // Barge-in: Gemini detected the caller spoke over it
+                    // Barge-in
                     if (sc.interrupted) {
                         console.log('Gemini signalled interruption');
                         handleInterruption();
                         return;
                     }
 
-                    // Audio data from Gemini (PCM 24kHz) → convert → send to Twilio (mulaw 8kHz)
+                    // Input transcription (what caller said)
+                    if (sc.inputTranscription && sc.inputTranscription.text) {
+                        console.log(`Caller said: "${sc.inputTranscription.text}"`);
+                    }
+
+                    // Output transcription (what Gemini said)
+                    if (sc.outputTranscription && sc.outputTranscription.text) {
+                        console.log(`Gemini said: "${sc.outputTranscription.text}"`);
+                    }
+
+                    // Audio + text parts from Gemini
                     if (sc.modelTurn && sc.modelTurn.parts) {
                         for (const part of sc.modelTurn.parts) {
 
-                            // Accumulate text parts to detect [END_CALL] signal
+                            // Accumulate text to detect [END_CALL]
                             if (part.text) {
                                 accumulatedText += part.text;
                                 if (accumulatedText.includes('[END_CALL]')) {
-                                    console.log('End call intent detected in Gemini response');
-                                    // Don't end yet — wait for turnComplete so audio finishes
-                                    callEnded = true; // flag it, actual cleanup on turnComplete
+                                    console.log('End call intent detected');
+                                    callEnded = true; // flag — actual close happens on turnComplete
                                 }
                             }
 
+                            // Audio: PCM 24kHz → mulaw 8kHz → Twilio
                             if (part.inlineData && part.inlineData.data) {
                                 const mimeType = part.inlineData.mimeType || '';
-
-                                // Gemini returns audio/pcm at 24kHz
                                 if (mimeType.startsWith('audio/pcm') || mimeType === 'audio/pcm;rate=24000') {
                                     const mulawPayload = pcm16Base64ToMulawBase64(part.inlineData.data);
-
                                     const mediaEvent = {
                                         event: 'media',
                                         streamSid,
                                         media: { payload: mulawPayload }
                                     };
                                     connection.send(JSON.stringify(mediaEvent));
-
                                     if (!responseStartTimestampTwilio) {
                                         responseStartTimestampTwilio = latestMediaTimestamp;
                                     }
-
                                     sendMark();
                                 }
                             }
                         }
                     }
 
-                    // Turn complete: Gemini finished speaking
+                    // Turn complete — safe to end if flagged
                     if (sc.turnComplete) {
                         console.log('Gemini turn complete');
-                        // If END_CALL was flagged, now it's safe to end — audio is fully done
                         if (callEnded) {
                             console.log('Goodbye audio finished, ending call now');
                             setTimeout(() => {
                                 if (connection.readyState === WebSocket.OPEN) connection.close();
                                 if (geminiWs.readyState === WebSocket.OPEN) geminiWs.close();
-                            }, 500); // tiny buffer just in case
+                            }, 500);
                         }
-                        accumulatedText = ''; // reset for next turn
+                        accumulatedText = '';
                     }
                 }
 
@@ -426,11 +452,8 @@ if (msg.serverContent) {
 
                     case 'media':
                         latestMediaTimestamp = data.media.timestamp;
-
                         if (geminiWs.readyState === WebSocket.OPEN && geminiReady) {
-                            // Convert mulaw 8kHz → PCM16 16kHz for Gemini
                             const pcm16Payload = mulawBase64ToPcm16Base64(data.media.payload);
-
                             const realtimeInput = {
                                 realtime_input: {
                                     media_chunks: [{
