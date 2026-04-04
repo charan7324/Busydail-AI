@@ -3,21 +3,36 @@ import WebSocket from 'ws';
 import dotenv from 'dotenv';
 import fastifyFormBody from '@fastify/formbody';
 import fastifyWs from '@fastify/websocket';
+import { createClient } from '@supabase/supabase-js';
 
 // Load environment variables from .env file
 dotenv.config();
 
-const { GEMINI_API_KEY, TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER } = process.env;
+const {
+    GEMINI_API_KEY,
+    TWILIO_ACCOUNT_SID,
+    TWILIO_AUTH_TOKEN,
+    TWILIO_PHONE_NUMBER,
+    SUPABASE_URL,
+    SUPABASE_SERVICE_KEY
+} = process.env;
 
+// Validate environment variables
 if (!GEMINI_API_KEY) {
-    console.error('Missing Gemini API key. Please set GEMINI_API_KEY in the .env file.');
+    console.error('Missing GEMINI_API_KEY');
+    process.exit(1);
+}
+if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !TWILIO_PHONE_NUMBER) {
+    console.error('Missing Twilio credentials');
+    process.exit(1);
+}
+if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
+    console.error('Missing Supabase credentials');
     process.exit(1);
 }
 
-if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !TWILIO_PHONE_NUMBER) {
-    console.error('Missing Twilio credentials. Please set TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER.');
-    process.exit(1);
-}
+// Initialize Supabase client (service role — full access for backend)
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 
 // Initialize Fastify
 const fastify = Fastify();
@@ -81,10 +96,6 @@ const GEMINI_WS_URL =
     `.GenerativeService.BidiGenerateContent?key=${GEMINI_API_KEY}`;
 
 // ─── Audio conversion helpers ─────────────────────────────────────────────────
-//
-//  Twilio Media Streams use G.711 µ-law (mulaw) at 8 kHz.
-//  Gemini Live API expects raw PCM 16-bit LE at 16 kHz (input)
-//  and returns raw PCM 16-bit LE at 24 kHz (output).
 
 /** Decode a single µ-law byte to a linear 16-bit PCM sample */
 function mulawToLinear(u) {
@@ -119,10 +130,7 @@ function linearToMulaw(sample) {
     return mulawByte;
 }
 
-/**
- * Convert base64-encoded µ-law 8kHz mono → base64-encoded PCM-16 16kHz mono.
- * Upsampling: simple 2× linear interpolation.
- */
+/** µ-law 8kHz → PCM-16 16kHz */
 function mulawBase64ToPcm16Base64(mulawBase64) {
     const mulawBuf = Buffer.from(mulawBase64, 'base64');
     const pcm8k = new Int16Array(mulawBuf.length);
@@ -136,14 +144,10 @@ function mulawBase64ToPcm16Base64(mulawBase64) {
     }
     pcm16k[(pcm8k.length - 1) * 2]     = pcm8k[pcm8k.length - 1];
     pcm16k[(pcm8k.length - 1) * 2 + 1] = pcm8k[pcm8k.length - 1];
-    const out = Buffer.from(pcm16k.buffer);
-    return out.toString('base64');
+    return Buffer.from(pcm16k.buffer).toString('base64');
 }
 
-/**
- * Convert base64-encoded PCM-16 24kHz mono (Gemini output) → base64-encoded µ-law 8kHz mono.
- * Downsampling: 24kHz → 8kHz = pick every 3rd sample.
- */
+/** PCM-16 24kHz → µ-law 8kHz */
 function pcm16Base64ToMulawBase64(pcm16Base64) {
     const pcmBuf = Buffer.from(pcm16Base64, 'base64');
     const pcm24k = new Int16Array(pcmBuf.buffer, pcmBuf.byteOffset, pcmBuf.byteLength / 2);
@@ -155,6 +159,82 @@ function pcm16Base64ToMulawBase64(pcm16Base64) {
     return mulaw8k.toString('base64');
 }
 
+// ─── Supabase helpers ─────────────────────────────────────────────────────────
+
+/** Create a new call record in Supabase */
+async function createCallRecord({ businessId, contactId, direction, twilioCallSid }) {
+    const { data, error } = await supabase
+        .from('calls')
+        .insert({
+            business_id: businessId || null,
+            contact_id: contactId || null,
+            direction,
+            status: 'in-progress',
+            twilio_call_sid: twilioCallSid || null,
+            started_at: new Date().toISOString()
+        })
+        .select()
+        .single();
+
+    if (error) {
+        console.error('Error creating call record:', error.message);
+        return null;
+    }
+    console.log(`Call record created: ${data.id}`);
+    return data.id;
+}
+
+/** Update call record when call ends */
+async function updateCallRecord(callId, { status, callerTranscript, geminiTranscript, durationSeconds }) {
+    if (!callId) return;
+
+    const { error } = await supabase
+        .from('calls')
+        .update({
+            status,
+            caller_transcript: callerTranscript || null,
+            gemini_transcript: geminiTranscript || null,
+            duration_seconds: durationSeconds || 0,
+            ended_at: new Date().toISOString()
+        })
+        .eq('id', callId);
+
+    if (error) {
+        console.error('Error updating call record:', error.message);
+    } else {
+        console.log(`Call record updated: ${callId} — ${status}`);
+    }
+}
+
+/** Increment calls_used_this_month for a business */
+async function incrementBusinessCallCount(businessId) {
+    if (!businessId) return;
+    const { error } = await supabase.rpc('increment_calls_used', { business_id_input: businessId });
+    if (error) console.error('Error incrementing call count:', error.message);
+}
+
+/** Check if business has reached their plan limit */
+async function checkCallLimit(businessId) {
+    if (!businessId) return true; // no business = allow call (testing mode)
+
+    const { data, error } = await supabase
+        .from('businesses')
+        .select('plan, calls_used_this_month')
+        .eq('id', businessId)
+        .single();
+
+    if (error || !data) return true;
+
+    const limits = { free: 50, starter: 500, pro: 2000, enterprise: Infinity };
+    const limit = limits[data.plan] || 50;
+
+    if (data.calls_used_this_month >= limit) {
+        console.log(`Business ${businessId} has reached their ${data.plan} plan limit`);
+        return false;
+    }
+    return true;
+}
+
 // ─── Routes ───────────────────────────────────────────────────────────────────
 
 // Health check
@@ -162,12 +242,16 @@ fastify.get('/', async (request, reply) => {
     reply.send({ message: 'Twilio + Gemini Live API Media Stream Server is running!' });
 });
 
-// TwiML for incoming/outbound calls — connects directly to Gemini, no pre-recorded message
+// TwiML for incoming/outbound calls
 fastify.all('/incoming-call', async (request, reply) => {
     const twimlResponse = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Connect>
-        <Stream url="wss://${request.headers.host}/media-stream" />
+        <Stream url="wss://${request.headers.host}/media-stream">
+            <Parameter name="businessId" value="${request.query.businessId || ''}" />
+            <Parameter name="contactId" value="${request.query.contactId || ''}" />
+            <Parameter name="direction" value="${request.query.direction || 'inbound'}" />
+        </Stream>
     </Connect>
 </Response>`;
     reply.type('text/xml').send(twimlResponse);
@@ -176,53 +260,59 @@ fastify.all('/incoming-call', async (request, reply) => {
 // ─── Outbound Call Route ──────────────────────────────────────────────────────
 
 fastify.post('/make-call', async (request, reply) => {
-    let { to } = request.body;
+    const { to, businessId, contactId } = request.body;
 
-    // Convert to array if it's just a single string
-    const numbers = Array.isArray(to) ? to : [to];
-
-    if (!numbers.length || !numbers[0]) {
-        return reply.status(400).send({ error: 'Missing "to" phone number(s)' });
+    if (!to) {
+        return reply.status(400).send({ error: 'Missing "to" phone number' });
     }
 
-    const credentials = Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString('base64');
+    // Check plan limit before making call
+    const withinLimit = await checkCallLimit(businessId);
+    if (!withinLimit) {
+        return reply.status(403).send({
+            error: 'Monthly call limit reached. Please upgrade your plan.'
+        });
+    }
 
-    // Create a list of promises for each call
-    const callPromises = numbers.map(async (phoneNumber) => {
-        try {
-            const response = await fetch(
-                `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Calls.json`,
-                {
-                    method: 'POST',
-                    headers: {
-                        'Authorization': `Basic ${credentials}`,
-                        'Content-Type': 'application/x-www-form-urlencoded'
-                    },
-                    body: new URLSearchParams({
-                        To: phoneNumber,
-                        From: TWILIO_PHONE_NUMBER,
-                        Url: `https://${request.headers.host}/incoming-call`
-                    }).toString()
-                }
-            );
+    try {
+        const credentials = Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString('base64');
 
-            const data = await response.json();
-            if (data.sid) {
-                return { success: true, number: phoneNumber, callSid: data.sid };
-            } else {
-                return { success: false, number: phoneNumber, error: data.message };
+        // Build webhook URL with businessId and contactId as query params
+        const webhookUrl = new URL(`https://${request.headers.host}/incoming-call`);
+        if (businessId) webhookUrl.searchParams.set('businessId', businessId);
+        if (contactId) webhookUrl.searchParams.set('contactId', contactId);
+        webhookUrl.searchParams.set('direction', 'outbound');
+
+        const response = await fetch(
+            `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Calls.json`,
+            {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Basic ${credentials}`,
+                    'Content-Type': 'application/x-www-form-urlencoded'
+                },
+                body: new URLSearchParams({
+                    To: to,
+                    From: TWILIO_PHONE_NUMBER,
+                    Url: webhookUrl.toString()
+                }).toString()
             }
-        } catch (err) {
-            return { success: false, number: phoneNumber, error: err.message };
-        }
-    });
+        );
 
-    // Fire them all off simultaneously
-    const results = await Promise.allSettled(callPromises);
-    
-    // Format the response for your CMD
-    const summary = results.map(r => r.value);
-    reply.send({ summary });
+        const data = await response.json();
+
+        if (data.sid) {
+            console.log(`Outbound call initiated: ${data.sid} → ${to}`);
+            reply.send({ success: true, callSid: data.sid, to });
+        } else {
+            console.error('Twilio error:', data);
+            reply.status(500).send({ success: false, error: data.message || 'Failed to initiate call' });
+        }
+
+    } catch (err) {
+        console.error('Error making outbound call:', err);
+        reply.status(500).send({ success: false, error: err.message });
+    }
 });
 
 // ─── WebSocket: /media-stream ─────────────────────────────────────────────────
@@ -242,8 +332,17 @@ fastify.register(async (fastify) => {
         let callTimer = null;
         let accumulatedText = '';
 
+        // Call tracking
+        let callId = null;
+        let businessId = null;
+        let contactId = null;
+        let direction = 'inbound';
+        let callStartTime = null;
+        let callerTranscriptParts = [];
+        let geminiTranscriptParts = [];
+
         // ── End the call gracefully ──
-        const endCall = (reason = 'timeout') => {
+        const endCall = async (reason = 'timeout') => {
             if (callEnded && reason !== 'timeout' && reason !== 'caller_hung_up') return;
 
             if (callTimer) {
@@ -268,13 +367,39 @@ fastify.register(async (fastify) => {
                     }
                 };
                 geminiWs.send(JSON.stringify(goodbyeMsg));
-                // turnComplete handler will close connection after audio finishes
+                // turnComplete handler will save to DB and close connection
 
             } else {
                 callEnded = true;
+                await saveCallToDatabase(reason);
                 if (connection.readyState === WebSocket.OPEN) connection.close();
                 if (geminiWs.readyState === WebSocket.OPEN) geminiWs.close();
             }
+        };
+
+        // ── Save call data to Supabase ──
+        const saveCallToDatabase = async (reason) => {
+            if (!callId) return;
+
+            const durationSeconds = callStartTime
+                ? Math.floor((Date.now() - callStartTime) / 1000)
+                : 0;
+
+            const status = reason === 'caller_hung_up' || reason === 'user_intent'
+                ? 'completed'
+                : reason === 'timeout'
+                ? 'completed'
+                : 'completed';
+
+            await updateCallRecord(callId, {
+                status,
+                callerTranscript: callerTranscriptParts.join('\n') || null,
+                geminiTranscript: geminiTranscriptParts.join('\n') || null,
+                durationSeconds
+            });
+
+            // Increment business call count
+            await incrementBusinessCallCount(businessId);
         };
 
         // ── Open Gemini Live API WebSocket ──
@@ -377,14 +502,18 @@ fastify.register(async (fastify) => {
                         return;
                     }
 
-                    // Input transcription (what caller said)
+                    // Input transcription (what caller said) — save to transcript
                     if (sc.inputTranscription && sc.inputTranscription.text) {
-                        console.log(`Caller said: "${sc.inputTranscription.text}"`);
+                        const text = sc.inputTranscription.text;
+                        console.log(`Caller said: "${text}"`);
+                        callerTranscriptParts.push(`Caller: ${text}`);
                     }
 
-                    // Output transcription (what Gemini said)
+                    // Output transcription (what Gemini said) — save to transcript
                     if (sc.outputTranscription && sc.outputTranscription.text) {
-                        console.log(`Gemini said: "${sc.outputTranscription.text}"`);
+                        const text = sc.outputTranscription.text;
+                        console.log(`Gemini said: "${text}"`);
+                        geminiTranscriptParts.push(`AI: ${text}`);
                     }
 
                     // Audio + text parts from Gemini
@@ -396,7 +525,7 @@ fastify.register(async (fastify) => {
                                 accumulatedText += part.text;
                                 if (accumulatedText.includes('[END_CALL]')) {
                                     console.log('End call intent detected');
-                                    callEnded = true; // flag — actual close happens on turnComplete
+                                    callEnded = true; // flag — actual close on turnComplete
                                 }
                             }
 
@@ -424,8 +553,9 @@ fastify.register(async (fastify) => {
                     if (sc.turnComplete) {
                         console.log('Gemini turn complete');
                         if (callEnded) {
-                            console.log('Goodbye audio finished, ending call now');
-                            setTimeout(() => {
+                            console.log('Goodbye audio finished, saving and ending call');
+                            setTimeout(async () => {
+                                await saveCallToDatabase('user_intent');
                                 if (connection.readyState === WebSocket.OPEN) connection.close();
                                 if (geminiWs.readyState === WebSocket.OPEN) geminiWs.close();
                             }, 500);
@@ -440,14 +570,31 @@ fastify.register(async (fastify) => {
         });
 
         // ── Twilio WebSocket events ──
-        connection.on('message', (message) => {
+        connection.on('message', async (message) => {
             try {
                 const data = JSON.parse(message);
 
                 switch (data.event) {
                     case 'start':
                         streamSid = data.start.streamSid;
-                        console.log('Stream started:', streamSid);
+                        callStartTime = Date.now();
+
+                        // Extract businessId, contactId, direction from stream parameters
+                        const params = data.start.customParameters || {};
+                        businessId = params.businessId || null;
+                        contactId = params.contactId || null;
+                        direction = params.direction || 'inbound';
+
+                        console.log(`Stream started: ${streamSid} | Business: ${businessId} | Direction: ${direction}`);
+
+                        // Create call record in Supabase
+                        callId = await createCallRecord({
+                            businessId,
+                            contactId,
+                            direction,
+                            twilioCallSid: streamSid
+                        });
+
                         responseStartTimestampTwilio = null;
                         latestMediaTimestamp = 0;
 
