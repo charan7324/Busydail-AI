@@ -39,6 +39,18 @@ const fastify = Fastify();
 fastify.register(fastifyFormBody);
 fastify.register(fastifyWs);
 
+// CORS
+fastify.addHook('onRequest', (request, reply, done) => {
+    reply.header('Access-Control-Allow-Origin', '*');
+    reply.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    reply.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    if (request.method === 'OPTIONS') {
+        reply.code(200).send();
+        return;
+    }
+    done();
+});
+
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 const SYSTEM_MESSAGE = `You are a real Indian human caller speaking naturally over a phone call.
