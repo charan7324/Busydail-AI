@@ -426,27 +426,41 @@ fastify.register(async (fastify) => {
 
         // ── Initialise Gemini session ──
         const initializeGeminiSession = () => {
+            const finalPrompt = agentPromptOverride
+        ? `${agentPromptOverride}
+
+Additionally follow these natural conversation rules:
+- Use natural fillers: "hmm...", "uh...", "okay...", "actually..."
+- Keep responses VERY SHORT — 1-2 sentences max
+- If user is silent: "hello... are you there?"
+- If user wants to end call: say a warm goodbye and append [END_CALL] at the very end of your text response
+- If you receive internal instruction to end due to time: say casual goodbye and append [END_CALL]
+- Detect end intent from: "bye", "goodbye", "I'll let you go", "I have to go", "call me later", "we're done", "that's all", "I'm busy" etc.
+- The [END_CALL] tag is never spoken — it is only a signal`
+        : SYSTEM_MESSAGE;
+
+    const finalVoice = agentVoiceOverride || VOICE;
             const setupMsg = {
-                setup: {
-                    model: `models/${MODEL}`,
-                    generation_config: {
-                        response_modalities: ['AUDIO'],
-                        speech_config: {
-                            voice_config: {
-                                prebuilt_voice_config: { voice_name: agentVoiceOverride || VOICE }
-                            }
-                        }
-                    },
-                    input_audio_transcription: {},
-                    output_audio_transcription: {},
-                    system_instruction: {
-    parts: [{ text: agentPromptOverride || SYSTEM_MESSAGE }]
-}
+        setup: {
+            model: `models/${MODEL}`,
+            generation_config: {
+                response_modalities: ['AUDIO'],
+                speech_config: {
+                    voice_config: {
+                        prebuilt_voice_config: { voice_name: finalVoice }
+                    }
                 }
-            };
-            console.log('Sending Gemini setup message');
-            geminiWs.send(JSON.stringify(setupMsg));
-        };
+            },
+            input_audio_transcription: {},
+            output_audio_transcription: {},
+            system_instruction: {
+                parts: [{ text: finalPrompt }]
+            }
+        }
+    };
+    console.log('Sending Gemini setup with voice:', finalVoice);
+    geminiWs.send(JSON.stringify(setupMsg));
+};
 
         // ── Gemini greets the caller first ──
         const sendInitialGreeting = () => {
@@ -495,9 +509,9 @@ fastify.register(async (fastify) => {
 
         // ── Gemini WebSocket events ──
         geminiWs.on('open', () => {
-            console.log('Connected to Gemini Live API');
-            setTimeout(initializeGeminiSession, 100);
-        });
+    console.log('Connected to Gemini Live API');
+    // Session initialized after stream starts so we have agent params
+});
 
         geminiWs.on('message', (data) => {
             try {
@@ -595,36 +609,47 @@ fastify.register(async (fastify) => {
 
                 switch (data.event) {
                     case 'start':
-                        streamSid = data.start.streamSid;
-                        callStartTime = Date.now();
+    streamSid = data.start.streamSid;
+    callStartTime = Date.now();
 
-                        // Extract businessId, contactId, direction from stream parameters
-                        const params = data.start.customParameters || {};
-                        businessId = params.businessId || null;
-                        contactId = params.contactId || null;
-                        direction = params.direction || 'inbound';
-                        agentPromptOverride = params.agentPrompt || null;
-                        agentVoiceOverride = params.agentVoice || null;
+    // Extract all params including agent prompt and voice
+    const params = data.start.customParameters || {};
+    businessId = params.businessId || null;
+    contactId = params.contactId || null;
+    direction = params.direction || 'inbound';
+    agentPromptOverride = params.agentPrompt ? decodeURIComponent(params.agentPrompt) : null;
+    agentVoiceOverride = params.agentVoice || null;
 
-                        console.log(`Stream started: ${streamSid} | Business: ${businessId} | Direction: ${direction}`);
+    console.log(`Stream started: ${streamSid} | Business: ${businessId} | Direction: ${direction}`);
+    console.log(`Agent prompt: ${agentPromptOverride ? 'custom' : 'default'} | Voice: ${agentVoiceOverride || 'default'}`);
 
-                        // Create call record in Supabase
-                        callId = await createCallRecord({
-                            businessId,
-                            contactId,
-                            direction,
-                            twilioCallSid: streamSid
-                        });
+    // Now initialize Gemini session with correct agent params
+    if (geminiWs.readyState === WebSocket.OPEN) {
+        setTimeout(initializeGeminiSession, 100);
+    } else {
+        // Wait for Gemini to connect then initialize
+        geminiWs.once('open', () => {
+            setTimeout(initializeGeminiSession, 100);
+        });
+    }
 
-                        responseStartTimestampTwilio = null;
-                        latestMediaTimestamp = 0;
+    // Create call record in Supabase
+    callId = await createCallRecord({
+        businessId,
+        contactId,
+        direction,
+        twilioCallSid: streamSid
+    });
 
-                        // Start 2-minute call limit timer
-                        callTimer = setTimeout(() => {
-                            console.log('Call duration limit reached');
-                            endCall('timeout');
-                        }, MAX_CALL_DURATION_MS);
-                        break;
+    responseStartTimestampTwilio = null;
+    latestMediaTimestamp = 0;
+
+    // Start 2-minute call limit timer
+    callTimer = setTimeout(() => {
+        console.log('Call duration limit reached');
+        endCall('timeout');
+    }, MAX_CALL_DURATION_MS);
+    break;
 
                     case 'media':
                         latestMediaTimestamp = data.media.timestamp;
