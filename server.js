@@ -256,6 +256,7 @@ fastify.get('/', async (request, reply) => {
 
 // TwiML for incoming/outbound calls
 fastify.all('/incoming-call', async (request, reply) => {
+    const agentPrompt = request.query.agentPrompt ? decodeURIComponent(request.query.agentPrompt) : '';
     const twimlResponse = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Connect>
@@ -263,6 +264,8 @@ fastify.all('/incoming-call', async (request, reply) => {
             <Parameter name="businessId" value="${request.query.businessId || ''}" />
             <Parameter name="contactId" value="${request.query.contactId || ''}" />
             <Parameter name="direction" value="${request.query.direction || 'inbound'}" />
+            <Parameter name="agentPrompt" value="${agentPrompt}" />
+            <Parameter name="agentVoice" value="${request.query.agentVoice || 'Aoede'}" />
         </Stream>
     </Connect>
 </Response>`;
@@ -272,7 +275,7 @@ fastify.all('/incoming-call', async (request, reply) => {
 // ─── Outbound Call Route ──────────────────────────────────────────────────────
 
 fastify.post('/make-call', async (request, reply) => {
-    const { to, businessId, contactId } = request.body;
+    const { to, businessId, contactId, agentPrompt, agentVoice } = request.body;
 
     if (!to) {
         return reply.status(400).send({ error: 'Missing "to" phone number' });
@@ -291,9 +294,11 @@ fastify.post('/make-call', async (request, reply) => {
 
         // Build webhook URL with businessId and contactId as query params
         const webhookUrl = new URL(`https://${request.headers.host}/incoming-call`);
-        if (businessId) webhookUrl.searchParams.set('businessId', businessId);
-        if (contactId) webhookUrl.searchParams.set('contactId', contactId);
-        webhookUrl.searchParams.set('direction', 'outbound');
+if (businessId) webhookUrl.searchParams.set('businessId', businessId);
+if (contactId) webhookUrl.searchParams.set('contactId', contactId);
+if (agentPrompt) webhookUrl.searchParams.set('agentPrompt', encodeURIComponent(agentPrompt));
+if (agentVoice) webhookUrl.searchParams.set('agentVoice', agentVoice);
+webhookUrl.searchParams.set('direction', 'outbound');
 
         const response = await fetch(
             `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Calls.json`,
@@ -343,6 +348,8 @@ fastify.register(async (fastify) => {
         let callEnded = false;
         let callTimer = null;
         let accumulatedText = '';
+        let agentPromptOverride = null;
+        let agentVoiceOverride = null;
 
         // Call tracking
         let callId = null;
@@ -426,15 +433,15 @@ fastify.register(async (fastify) => {
                         response_modalities: ['AUDIO'],
                         speech_config: {
                             voice_config: {
-                                prebuilt_voice_config: { voice_name: VOICE }
+                                prebuilt_voice_config: { voice_name: agentVoiceOverride || VOICE }
                             }
                         }
                     },
                     input_audio_transcription: {},
                     output_audio_transcription: {},
                     system_instruction: {
-                        parts: [{ text: SYSTEM_MESSAGE }]
-                    }
+    parts: [{ text: agentPromptOverride || SYSTEM_MESSAGE }]
+}
                 }
             };
             console.log('Sending Gemini setup message');
@@ -596,6 +603,8 @@ fastify.register(async (fastify) => {
                         businessId = params.businessId || null;
                         contactId = params.contactId || null;
                         direction = params.direction || 'inbound';
+                        agentPromptOverride = params.agentPrompt || null;
+                        agentVoiceOverride = params.agentVoice || null;
 
                         console.log(`Stream started: ${streamSid} | Business: ${businessId} | Direction: ${direction}`);
 
