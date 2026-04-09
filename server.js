@@ -197,7 +197,7 @@ async function createCallRecord({ businessId, contactId, direction, twilioCallSi
 }
 
 /** Update call record when call ends */
-async function updateCallRecord(callId, { status, callerTranscript, geminiTranscript, durationSeconds }) {
+async function updateCallRecord(callId, { status, callerTranscript, geminiTranscript, durationSeconds, summary }) {
     if (!callId) return;
 
     const { error } = await supabase
@@ -207,6 +207,7 @@ async function updateCallRecord(callId, { status, callerTranscript, geminiTransc
             caller_transcript: callerTranscript || null,
             gemini_transcript: geminiTranscript || null,
             duration_seconds: durationSeconds || 0,
+            summary: summary || null,
             ended_at: new Date().toISOString()
         })
         .eq('id', callId);
@@ -260,6 +261,43 @@ async function getAgentById(agentId) {
         return null;
     }
     return data;
+}
+
+/** Generate call summary using Gemini */
+async function generateCallSummary(callerTranscript, geminiTranscript) {
+    if (!callerTranscript && !geminiTranscript) return null;
+
+    try {
+        const fullTranscript = `${callerTranscript || ''}\n${geminiTranscript || ''}`.trim();
+
+        const response = await fetch(
+            `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`,
+            {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    contents: [{
+                        parts: [{
+                            text: `You are a call summarizer. Summarize the following phone call transcript in 3-4 short bullet points. Focus on: what was discussed, any decisions made, and next steps if any. Keep it concise and professional.
+
+Transcript:
+${fullTranscript}
+
+Summary:`
+                        }]
+                    }]
+                })
+            }
+        );
+
+        const data = await response.json();
+        const summary = data.candidates?.[0]?.content?.parts?.[0]?.text;
+        return summary || null;
+
+    } catch (err) {
+        console.error('Error generating summary:', err.message);
+        return null;
+    }
 }
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
@@ -410,28 +448,30 @@ fastify.register(async (fastify) => {
 
         // ── Save call data to Supabase ──
         const saveCallToDatabase = async (reason) => {
-            if (!callId) return;
+    if (!callId) return;
 
-            const durationSeconds = callStartTime
-                ? Math.floor((Date.now() - callStartTime) / 1000)
-                : 0;
+    const durationSeconds = callStartTime
+        ? Math.floor((Date.now() - callStartTime) / 1000)
+        : 0;
 
-            const status = reason === 'caller_hung_up' || reason === 'user_intent'
-                ? 'completed'
-                : reason === 'timeout'
-                ? 'completed'
-                : 'completed';
+    const callerTranscript = callerTranscriptParts.join('\n') || null;
+    const geminiTranscript = geminiTranscriptParts.join('\n') || null;
 
-            await updateCallRecord(callId, {
-                status,
-                callerTranscript: callerTranscriptParts.join('\n') || null,
-                geminiTranscript: geminiTranscriptParts.join('\n') || null,
-                durationSeconds
-            });
+    // Generate AI summary
+    console.log('Generating call summary...');
+    const summary = await generateCallSummary(callerTranscript, geminiTranscript);
+    console.log('Summary generated:', summary ? 'yes' : 'no');
 
-            // Increment business call count
-            await incrementBusinessCallCount(businessId);
-        };
+    await updateCallRecord(callId, {
+        status: 'completed',
+        callerTranscript,
+        geminiTranscript,
+        durationSeconds,
+        summary
+    });
+
+    await incrementBusinessCallCount(businessId);
+};
 
         // ── Open Gemini Live API WebSocket ──
         const geminiWs = new WebSocket(GEMINI_WS_URL);
