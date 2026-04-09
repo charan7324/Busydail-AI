@@ -247,6 +247,21 @@ async function checkCallLimit(businessId) {
     return true;
 }
 
+/** Fetch agent details from Supabase by agent ID */
+async function getAgentById(agentId) {
+    if (!agentId) return null;
+    const { data, error } = await supabase
+        .from('agents')
+        .select('*')
+        .eq('id', agentId)
+        .single();
+    if (error) {
+        console.error('Error fetching agent:', error.message);
+        return null;
+    }
+    return data;
+}
+
 // ─── Routes ───────────────────────────────────────────────────────────────────
 
 // Health check
@@ -256,7 +271,6 @@ fastify.get('/', async (request, reply) => {
 
 // TwiML for incoming/outbound calls
 fastify.all('/incoming-call', async (request, reply) => {
-    const agentPrompt = request.query.agentPrompt ? decodeURIComponent(request.query.agentPrompt) : '';
     const twimlResponse = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Connect>
@@ -264,8 +278,7 @@ fastify.all('/incoming-call', async (request, reply) => {
             <Parameter name="businessId" value="${request.query.businessId || ''}" />
             <Parameter name="contactId" value="${request.query.contactId || ''}" />
             <Parameter name="direction" value="${request.query.direction || 'inbound'}" />
-            <Parameter name="agentPrompt" value="${agentPrompt}" />
-            <Parameter name="agentVoice" value="${request.query.agentVoice || 'Aoede'}" />
+            <Parameter name="agentId" value="${request.query.agentId || ''}" />
         </Stream>
     </Connect>
 </Response>`;
@@ -275,7 +288,7 @@ fastify.all('/incoming-call', async (request, reply) => {
 // ─── Outbound Call Route ──────────────────────────────────────────────────────
 
 fastify.post('/make-call', async (request, reply) => {
-    const { to, businessId, contactId, agentPrompt, agentVoice } = request.body;
+    const { to, businessId, contactId, agentId } = request.body;
 
     if (!to) {
         return reply.status(400).send({ error: 'Missing "to" phone number' });
@@ -296,8 +309,7 @@ fastify.post('/make-call', async (request, reply) => {
         const webhookUrl = new URL(`https://${request.headers.host}/incoming-call`);
 if (businessId) webhookUrl.searchParams.set('businessId', businessId);
 if (contactId) webhookUrl.searchParams.set('contactId', contactId);
-if (agentPrompt) webhookUrl.searchParams.set('agentPrompt', encodeURIComponent(agentPrompt));
-if (agentVoice) webhookUrl.searchParams.set('agentVoice', agentVoice);
+if (agentId) webhookUrl.searchParams.set('agentId', agentId);
 webhookUrl.searchParams.set('direction', 'outbound');
 
         const response = await fetch(
@@ -617,8 +629,17 @@ Additionally follow these natural conversation rules:
     businessId = params.businessId || null;
     contactId = params.contactId || null;
     direction = params.direction || 'inbound';
-    agentPromptOverride = params.agentPrompt ? decodeURIComponent(params.agentPrompt) : null;
-    agentVoiceOverride = params.agentVoice || null;
+    const agentId = params.agentId || null;
+
+// Fetch agent from Supabase if agentId provided
+if (agentId) {
+    const agent = await getAgentById(agentId);
+    if (agent) {
+        agentPromptOverride = agent.prompt;
+        agentVoiceOverride = agent.voice;
+        console.log(`Using agent: ${agent.name} | Voice: ${agent.voice}`);
+    }
+}
 
     console.log(`Stream started: ${streamSid} | Business: ${businessId} | Direction: ${direction}`);
     console.log(`Agent prompt: ${agentPromptOverride ? 'custom' : 'default'} | Voice: ${agentVoiceOverride || 'default'}`);
