@@ -228,7 +228,7 @@ async function incrementBusinessCallCount(businessId) {
 
 /** Check if business has reached their plan limit */
 async function checkCallLimit(businessId) {
-    if (!businessId) return true; // no business = allow call (testing mode)
+    if (!businessId) return true;
 
     const { data, error } = await supabase
         .from('businesses')
@@ -263,39 +263,60 @@ async function getAgentById(agentId) {
     return data;
 }
 
-/** Generate call summary using Gemini */
+/** Generate call summary using Gemini 2.5 Flash Lite — cheapest and fastest for text tasks */
 async function generateCallSummary(callerTranscript, geminiTranscript) {
-    if (!callerTranscript && !geminiTranscript) return null;
+    if (!callerTranscript && !geminiTranscript) {
+        console.log('No transcript to summarize');
+        return null;
+    }
 
     try {
-        const fullTranscript = `${callerTranscript || ''}\n${geminiTranscript || ''}`.trim();
+        const fullTranscript = [callerTranscript, geminiTranscript]
+            .filter(Boolean)
+            .join('\n')
+            .trim();
+
+        console.log('Transcript length for summary:', fullTranscript.length, 'chars');
 
         const response = await fetch(
-            `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`,
+            `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite-preview-06-17:generateContent?key=${GEMINI_API_KEY}`,
             {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                     contents: [{
                         parts: [{
-                            text: `You are a call summarizer. Summarize the following phone call transcript in 3-4 short bullet points. Focus on: what was discussed, any decisions made, and next steps if any. Keep it concise and professional.
+                            text: `Summarize this phone call in 3-4 bullet points. Cover what was discussed, decisions made, and next steps. Be concise and professional. Only return bullet points, no intro text.
 
 Transcript:
-${fullTranscript}
-
-Summary:`
+${fullTranscript}`
                         }]
-                    }]
+                    }],
+                    generationConfig: {
+                        maxOutputTokens: 300,
+                        temperature: 0.2
+                    }
                 })
             }
         );
 
-        const data = await response.json();
+        console.log('Summary API response status:', response.status);
+        const responseText = await response.text();
+        console.log('Summary API raw response:', responseText.slice(0, 300));
+
+        const data = JSON.parse(responseText);
+
+        if (data.error) {
+            console.error('Gemini summary API error:', data.error.message);
+            return null;
+        }
+
         const summary = data.candidates?.[0]?.content?.parts?.[0]?.text;
+        console.log('Summary result:', summary ? summary.slice(0, 100) + '...' : 'NULL');
         return summary || null;
 
     } catch (err) {
-        console.error('Error generating summary:', err.message);
+        console.error('Summary generation failed:', err.message);
         return null;
     }
 }
@@ -332,7 +353,6 @@ fastify.post('/make-call', async (request, reply) => {
         return reply.status(400).send({ error: 'Missing "to" phone number' });
     }
 
-    // Check plan limit before making call
     const withinLimit = await checkCallLimit(businessId);
     if (!withinLimit) {
         return reply.status(403).send({
@@ -343,12 +363,11 @@ fastify.post('/make-call', async (request, reply) => {
     try {
         const credentials = Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString('base64');
 
-        // Build webhook URL with businessId and contactId as query params
         const webhookUrl = new URL(`https://${request.headers.host}/incoming-call`);
-if (businessId) webhookUrl.searchParams.set('businessId', businessId);
-if (contactId) webhookUrl.searchParams.set('contactId', contactId);
-if (agentId) webhookUrl.searchParams.set('agentId', agentId);
-webhookUrl.searchParams.set('direction', 'outbound');
+        if (businessId) webhookUrl.searchParams.set('businessId', businessId);
+        if (contactId) webhookUrl.searchParams.set('contactId', contactId);
+        if (agentId) webhookUrl.searchParams.set('agentId', agentId);
+        webhookUrl.searchParams.set('direction', 'outbound');
 
         const response = await fetch(
             `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Calls.json`,
@@ -421,7 +440,6 @@ fastify.register(async (fastify) => {
 
             console.log(`Ending call. Reason: ${reason}`);
 
-            // If timeout → ask Gemini to say a natural goodbye first
             if (reason === 'timeout' && geminiWs.readyState === WebSocket.OPEN && geminiReady) {
                 callEnded = true;
                 const goodbyeMsg = {
@@ -436,7 +454,6 @@ fastify.register(async (fastify) => {
                     }
                 };
                 geminiWs.send(JSON.stringify(goodbyeMsg));
-                // turnComplete handler will save to DB and close connection
 
             } else {
                 callEnded = true;
@@ -448,30 +465,35 @@ fastify.register(async (fastify) => {
 
         // ── Save call data to Supabase ──
         const saveCallToDatabase = async (reason) => {
-    if (!callId) return;
+            if (!callId) return;
 
-    const durationSeconds = callStartTime
-        ? Math.floor((Date.now() - callStartTime) / 1000)
-        : 0;
+            const durationSeconds = callStartTime
+                ? Math.floor((Date.now() - callStartTime) / 1000)
+                : 0;
 
-    const callerTranscript = callerTranscriptParts.join('\n') || null;
-    const geminiTranscript = geminiTranscriptParts.join('\n') || null;
+            const callerTranscript = callerTranscriptParts.join('\n') || null;
+            const geminiTranscript = geminiTranscriptParts.join('\n') || null;
 
-    // Generate AI summary
-    console.log('Generating call summary...');
-    const summary = await generateCallSummary(callerTranscript, geminiTranscript);
-    console.log('Summary generated:', summary ? 'yes' : 'no');
+            console.log('--- SAVING CALL TO DATABASE ---');
+            console.log('Caller transcript parts:', callerTranscriptParts.length);
+            console.log('Gemini transcript parts:', geminiTranscriptParts.length);
+            console.log('Caller transcript length:', callerTranscript?.length || 0);
+            console.log('Gemini transcript length:', geminiTranscript?.length || 0);
 
-    await updateCallRecord(callId, {
-        status: 'completed',
-        callerTranscript,
-        geminiTranscript,
-        durationSeconds,
-        summary
-    });
+            // Generate AI summary
+            const summary = await generateCallSummary(callerTranscript, geminiTranscript);
 
-    await incrementBusinessCallCount(businessId);
-};
+            await updateCallRecord(callId, {
+                status: 'completed',
+                callerTranscript,
+                geminiTranscript,
+                durationSeconds,
+                summary
+            });
+
+            await incrementBusinessCallCount(businessId);
+            console.log('--- CALL SAVED SUCCESSFULLY ---');
+        };
 
         // ── Open Gemini Live API WebSocket ──
         const geminiWs = new WebSocket(GEMINI_WS_URL);
@@ -479,7 +501,7 @@ fastify.register(async (fastify) => {
         // ── Initialise Gemini session ──
         const initializeGeminiSession = () => {
             const finalPrompt = agentPromptOverride
-        ? `${agentPromptOverride}
+                ? `${agentPromptOverride}
 
 Additionally follow these natural conversation rules:
 - Use natural fillers: "hmm...", "uh...", "okay...", "actually..."
@@ -489,30 +511,31 @@ Additionally follow these natural conversation rules:
 - If you receive internal instruction to end due to time: say casual goodbye and append [END_CALL]
 - Detect end intent from: "bye", "goodbye", "I'll let you go", "I have to go", "call me later", "we're done", "that's all", "I'm busy" etc.
 - The [END_CALL] tag is never spoken — it is only a signal`
-        : SYSTEM_MESSAGE;
+                : SYSTEM_MESSAGE;
 
-    const finalVoice = agentVoiceOverride || VOICE;
+            const finalVoice = agentVoiceOverride || VOICE;
+
             const setupMsg = {
-        setup: {
-            model: `models/${MODEL}`,
-            generation_config: {
-                response_modalities: ['AUDIO'],
-                speech_config: {
-                    voice_config: {
-                        prebuilt_voice_config: { voice_name: finalVoice }
+                setup: {
+                    model: `models/${MODEL}`,
+                    generation_config: {
+                        response_modalities: ['AUDIO'],
+                        speech_config: {
+                            voice_config: {
+                                prebuilt_voice_config: { voice_name: finalVoice }
+                            }
+                        }
+                    },
+                    input_audio_transcription: {},
+                    output_audio_transcription: {},
+                    system_instruction: {
+                        parts: [{ text: finalPrompt }]
                     }
                 }
-            },
-            input_audio_transcription: {},
-            output_audio_transcription: {},
-            system_instruction: {
-                parts: [{ text: finalPrompt }]
-            }
-        }
-    };
-    console.log('Sending Gemini setup with voice:', finalVoice);
-    geminiWs.send(JSON.stringify(setupMsg));
-};
+            };
+            console.log('Sending Gemini setup with voice:', finalVoice);
+            geminiWs.send(JSON.stringify(setupMsg));
+        };
 
         // ── Gemini greets the caller first ──
         const sendInitialGreeting = () => {
@@ -561,9 +584,9 @@ Additionally follow these natural conversation rules:
 
         // ── Gemini WebSocket events ──
         geminiWs.on('open', () => {
-    console.log('Connected to Gemini Live API');
-    // Session initialized after stream starts so we have agent params
-});
+            console.log('Connected to Gemini Live API');
+            // Session initialized after stream starts so we have agent params
+        });
 
         geminiWs.on('message', (data) => {
             try {
@@ -587,14 +610,14 @@ Additionally follow these natural conversation rules:
                         return;
                     }
 
-                    // Input transcription (what caller said) — save to transcript
+                    // Input transcription (what caller said)
                     if (sc.inputTranscription && sc.inputTranscription.text) {
                         const text = sc.inputTranscription.text;
                         console.log(`Caller said: "${text}"`);
                         callerTranscriptParts.push(`Caller: ${text}`);
                     }
 
-                    // Output transcription (what Gemini said) — save to transcript
+                    // Output transcription (what Gemini said)
                     if (sc.outputTranscription && sc.outputTranscription.text) {
                         const text = sc.outputTranscription.text;
                         console.log(`Gemini said: "${text}"`);
@@ -610,7 +633,7 @@ Additionally follow these natural conversation rules:
                                 accumulatedText += part.text;
                                 if (accumulatedText.includes('[END_CALL]')) {
                                     console.log('End call intent detected');
-                                    callEnded = true; // flag — actual close on turnComplete
+                                    callEnded = true;
                                 }
                             }
 
@@ -661,56 +684,54 @@ Additionally follow these natural conversation rules:
 
                 switch (data.event) {
                     case 'start':
-    streamSid = data.start.streamSid;
-    callStartTime = Date.now();
+                        streamSid = data.start.streamSid;
+                        callStartTime = Date.now();
 
-    // Extract all params including agent prompt and voice
-    const params = data.start.customParameters || {};
-    businessId = params.businessId || null;
-    contactId = params.contactId || null;
-    direction = params.direction || 'inbound';
-    const agentId = params.agentId || null;
+                        const params = data.start.customParameters || {};
+                        businessId = params.businessId || null;
+                        contactId = params.contactId || null;
+                        direction = params.direction || 'inbound';
+                        const agentId = params.agentId || null;
 
-// Fetch agent from Supabase if agentId provided
-if (agentId) {
-    const agent = await getAgentById(agentId);
-    if (agent) {
-        agentPromptOverride = agent.prompt;
-        agentVoiceOverride = agent.voice;
-        console.log(`Using agent: ${agent.name} | Voice: ${agent.voice}`);
-    }
-}
+                        // Fetch agent from Supabase if agentId provided
+                        if (agentId) {
+                            const agent = await getAgentById(agentId);
+                            if (agent) {
+                                agentPromptOverride = agent.prompt;
+                                agentVoiceOverride = agent.voice;
+                                console.log(`Using agent: ${agent.name} | Voice: ${agent.voice}`);
+                            }
+                        }
 
-    console.log(`Stream started: ${streamSid} | Business: ${businessId} | Direction: ${direction}`);
-    console.log(`Agent prompt: ${agentPromptOverride ? 'custom' : 'default'} | Voice: ${agentVoiceOverride || 'default'}`);
+                        console.log(`Stream started: ${streamSid} | Business: ${businessId} | Direction: ${direction}`);
+                        console.log(`Agent: ${agentPromptOverride ? 'custom' : 'default'} | Voice: ${agentVoiceOverride || 'default'}`);
 
-    // Now initialize Gemini session with correct agent params
-    if (geminiWs.readyState === WebSocket.OPEN) {
-        setTimeout(initializeGeminiSession, 100);
-    } else {
-        // Wait for Gemini to connect then initialize
-        geminiWs.once('open', () => {
-            setTimeout(initializeGeminiSession, 100);
-        });
-    }
+                        // Initialize Gemini session with correct agent params
+                        if (geminiWs.readyState === WebSocket.OPEN) {
+                            setTimeout(initializeGeminiSession, 100);
+                        } else {
+                            geminiWs.once('open', () => {
+                                setTimeout(initializeGeminiSession, 100);
+                            });
+                        }
 
-    // Create call record in Supabase
-    callId = await createCallRecord({
-        businessId,
-        contactId,
-        direction,
-        twilioCallSid: streamSid
-    });
+                        // Create call record in Supabase
+                        callId = await createCallRecord({
+                            businessId,
+                            contactId,
+                            direction,
+                            twilioCallSid: streamSid
+                        });
 
-    responseStartTimestampTwilio = null;
-    latestMediaTimestamp = 0;
+                        responseStartTimestampTwilio = null;
+                        latestMediaTimestamp = 0;
 
-    // Start 2-minute call limit timer
-    callTimer = setTimeout(() => {
-        console.log('Call duration limit reached');
-        endCall('timeout');
-    }, MAX_CALL_DURATION_MS);
-    break;
+                        // Start 2-minute call limit timer
+                        callTimer = setTimeout(() => {
+                            console.log('Call duration limit reached');
+                            endCall('timeout');
+                        }, MAX_CALL_DURATION_MS);
+                        break;
 
                     case 'media':
                         latestMediaTimestamp = data.media.timestamp;
