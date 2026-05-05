@@ -90,13 +90,12 @@ const GEMINI_WS_URL =
 // These point to your uploaded files in Supabase Storage bucket "sounds"
 // Format: SUPABASE_URL/storage/v1/object/public/sounds/FILENAME.mp3
 const BACKGROUND_SOUND_URLS = {
-    office:      `${SUPABASE_URL}/storage/v1/object/public/sounds/office.mp3`,
-    call_center: `${SUPABASE_URL}/storage/v1/object/public/sounds/call_center.mp3`,
-    traffic:     `${SUPABASE_URL}/storage/v1/object/public/sounds/traffic.mp3`,
-    nature:      `${SUPABASE_URL}/storage/v1/object/public/sounds/nature.mp3`,
-    cafe:        `${SUPABASE_URL}/storage/v1/object/public/sounds/cafe.mp3`,
-    rain:        `${SUPABASE_URL}/storage/v1/object/public/sounds/rain.mp3`,
-    fan:         `${SUPABASE_URL}/storage/v1/object/public/sounds/fan.mp3`,
+    office:      `https://atauxjrnhbobpelsiggj.supabase.co/storage/v1/object/public/sounds%20bucket/office.mp3`,
+    call_center: `https://atauxjrnhbobpelsiggj.supabase.co/storage/v1/object/public/sounds%20bucket/call_center.mp3`,
+    traffic:     `https://atauxjrnhbobpelsiggj.supabase.co/storage/v1/object/public/sounds%20bucket/traffic.mp3`,
+    nature:      `https://atauxjrnhbobpelsiggj.supabase.co/storage/v1/object/public/sounds%20bucket/nature.mp3`,
+    cafe:        `https://atauxjrnhbobpelsiggj.supabase.co/storage/v1/object/public/sounds%20bucket/cafe.mp3`,
+    rain:        `https://atauxjrnhbobpelsiggj.supabase.co/storage/v1/object/public/sounds%20bucket/rain.mp3`,
 };
 
 // In-memory cache for decoded PCM sound buffers (loaded once, reused across calls)
