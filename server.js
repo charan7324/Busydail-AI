@@ -414,6 +414,8 @@ fastify.register(async (fastify) => {
         let accumulatedText = '';
         let agentPromptOverride = null;
         let agentVoiceOverride = null;
+        let soundPumpInterval = null;  // interval for continuous background sound
+        let isSpeaking = false;        // true when Gemini is actively sending audio
 
         // Background sound state
         let soundSamples = null;   // Int16Array of decoded PCM at 24kHz
@@ -446,6 +448,7 @@ fastify.register(async (fastify) => {
                 geminiWs.send(JSON.stringify(goodbyeMsg));
             } else {
                 callEnded = true;
+                stopSoundPump();
                 await saveCallToDatabase(reason);
                 if (connection.readyState === WebSocket.OPEN) connection.close();
                 if (geminiWs.readyState === WebSocket.OPEN) geminiWs.close();
@@ -530,6 +533,65 @@ Additionally follow these natural conversation rules:
             }
         };
 
+        // ── Continuous background sound pump ──
+// Sends background sound to Twilio continuously even during silence gaps
+const startSoundPump = () => {
+    if (!soundSamples || soundPumpInterval) return;
+
+    // Send ~20ms of audio every 20ms (matches Twilio's media stream cadence)
+    // At 8kHz mulaw: 20ms = 160 samples
+    const CHUNK_SIZE_8K = 160; // 160 mulaw samples = 20ms at 8kHz
+
+    // We need background sound at 8kHz mulaw for Twilio
+    // soundSamples is at 24kHz — so 20ms at 24kHz = 480 samples
+    const CHUNK_SIZE_24K = 480;
+
+    soundPumpInterval = setInterval(() => {
+        if (!streamSid || callEnded) return;
+        if (isSpeaking) return; // skip — Gemini is handling audio output with mixing
+
+        try {
+            // Get next chunk of background sound at 24kHz
+            const chunk = new Int16Array(CHUNK_SIZE_24K);
+            const vol = soundVolume / 100;
+
+            for (let i = 0; i < CHUNK_SIZE_24K; i++) {
+                chunk[i] = Math.round(soundSamples[soundOffset % soundSamples.length] * vol);
+                soundOffset++;
+            }
+
+            // Downsample 24kHz → 8kHz (pick every 3rd sample) and convert to mulaw
+            const mulaw8k = Buffer.alloc(CHUNK_SIZE_8K);
+            for (let i = 0; i < CHUNK_SIZE_8K; i++) {
+                mulaw8k[i] = linearToMulaw(Math.max(-32768, Math.min(32767, chunk[i * 3])));
+            }
+
+            const payload = mulaw8k.toString('base64');
+            if (connection.readyState === WebSocket.OPEN) {
+                connection.send(JSON.stringify({
+                    event: 'media',
+                    streamSid,
+                    media: { payload }
+                }));
+            }
+        } catch (err) {
+            console.error('Sound pump error:', err.message);
+        }
+    }, 20); // every 20ms
+
+    console.log('Background sound pump started');
+};
+
+const stopSoundPump = () => {
+    if (soundPumpInterval) {
+        clearInterval(soundPumpInterval);
+        soundPumpInterval = null;
+        console.log('Background sound pump stopped');
+    }
+};
+
+
+
         geminiWs.on('open', () => {
             console.log('Connected to Gemini Live API');
         });
@@ -578,6 +640,7 @@ Additionally follow these natural conversation rules:
                             if (part.inlineData?.data) {
                                 const mimeType = part.inlineData.mimeType || '';
                                 if (mimeType.startsWith('audio/pcm') || mimeType === 'audio/pcm;rate=24000') {
+                                    isSpeaking = true;
 
                                     let audioBase64 = part.inlineData.data;
 
@@ -607,6 +670,7 @@ Additionally follow these natural conversation rules:
 
                     if (sc.turnComplete) {
                         console.log('Gemini turn complete');
+                        isSpeaking = false;
                         if (callEnded) {
                             console.log('Goodbye audio finished, saving and ending call');
                             setTimeout(async () => {
@@ -654,6 +718,7 @@ Additionally follow these natural conversation rules:
                                     soundSamples = await loadSoundPCM(agent.background_sound);
                                     if (soundSamples) {
                                         console.log(`Background sound ready: ${agent.background_sound} — ${soundSamples.length} samples`);
+                                        startSoundPump();
                                     } else {
                                         console.log(`Background sound failed to load — call continues without sound`);
                                     }
@@ -709,6 +774,7 @@ Additionally follow these natural conversation rules:
 
         connection.on('close', () => {
             console.log('Twilio client disconnected');
+            stopSoundPump();
             endCall('connection_closed');
         });
 
