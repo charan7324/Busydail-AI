@@ -6,6 +6,7 @@ import fastifyWs from '@fastify/websocket';
 import { createClient } from '@supabase/supabase-js';
 import { spawn } from 'child_process';
 
+// Load environment variables from .env file
 dotenv.config();
 
 const {
@@ -27,6 +28,7 @@ const fastify = Fastify();
 fastify.register(fastifyFormBody);
 fastify.register(fastifyWs);
 
+// CORS
 fastify.addHook('onRequest', (request, reply, done) => {
     reply.header('Access-Control-Allow-Origin', '*');
     reply.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -84,8 +86,9 @@ const GEMINI_WS_URL =
     `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta` +
     `.GenerativeService.BidiGenerateContent?key=${GEMINI_API_KEY}`;
 
-// ─── Background Sound URLs ────────────────────────────────────────────────────
-
+// ─── Background Sound URLs (Supabase Storage) ────────────────────────────────
+// These point to your uploaded files in Supabase Storage bucket "sounds"
+// Format: SUPABASE_URL/storage/v1/object/public/sounds/FILENAME.mp3
 const BACKGROUND_SOUND_URLS = {
     office:      `https://atauxjrnhbobpelsiggj.supabase.co/storage/v1/object/public/sounds%20bucket/office.mp3`,
     call_center: `https://atauxjrnhbobpelsiggj.supabase.co/storage/v1/object/public/sounds%20bucket/call_center.mp3`,
@@ -95,18 +98,8 @@ const BACKGROUND_SOUND_URLS = {
     rain:        `https://atauxjrnhbobpelsiggj.supabase.co/storage/v1/object/public/sounds%20bucket/rain.mp3`,
 };
 
+// In-memory cache for decoded PCM sound buffers (loaded once, reused across calls)
 const soundCache = {};
-
-// ─── Filler words by language ─────────────────────────────────────────────────
-// These are sent to Gemini to speak during silence gaps to feel natural
-const FILLER_PHRASES = {
-    english:  ['hmm...', 'uh...', 'okay...', 'so...', 'right...', 'let me see...', 'one moment...'],
-    hindi:    ['hmm...', 'haan...', 'achha...', 'theek hai...', 'ek second...', 'sun raha hoon...'],
-    hinglish: ['hmm...', 'haan okay...', 'achha so...', 'ek second...', 'theek hai...', 'okay so...'],
-    telugu:   ['hmm...', 'okay...', 'oka second...', 'chustha...', 'aaa...', 'sare...'],
-    tamil:    ['hmm...', 'okay...', 'oru nimisham...', 'sari...', 'aama...', 'paakiren...'],
-    kannada:  ['hmm...', 'okay...', 'ondu nimisha...', 'sari...', 'nodthini...', 'hauda...'],
-};
 
 // ─── Audio conversion helpers ─────────────────────────────────────────────────
 
@@ -161,74 +154,112 @@ function pcm16Base64ToMulawBase64(pcm16Base64) {
 
 // ─── Background Sound helpers ─────────────────────────────────────────────────
 
+/**
+ * Convert any audio buffer (MP3/WAV) → raw PCM Int16 at 24kHz mono
+ * using ffmpeg which is available on Render's Linux environment
+ */
 function convertAudioToPcm24k(inputBuffer) {
     return new Promise((resolve, reject) => {
         const chunks = [];
         const ff = spawn('ffmpeg', [
-            '-i', 'pipe:0',
-            '-f', 's16le',
-            '-ar', '24000',
-            '-ac', '1',
-            '-loglevel', 'quiet',
-            'pipe:1'
+            '-i', 'pipe:0',       // input from stdin
+            '-f', 's16le',         // output format: signed 16-bit little-endian PCM
+            '-ar', '24000',        // output sample rate: 24kHz (matches Gemini output)
+            '-ac', '1',            // mono
+            '-loglevel', 'quiet',  // suppress ffmpeg output
+            'pipe:1'               // output to stdout
         ]);
+
         ff.stdout.on('data', chunk => chunks.push(chunk));
         ff.stdout.on('end', () => {
             const pcmBuf = Buffer.concat(chunks);
             resolve(new Int16Array(pcmBuf.buffer, pcmBuf.byteOffset, pcmBuf.byteLength / 2));
         });
-        ff.stderr.on('data', () => {});
+        ff.stderr.on('data', () => {}); // suppress
         ff.on('error', (err) => reject(new Error(`ffmpeg error: ${err.message}`)));
-        ff.stdin.on('error', () => {});
+        ff.stdin.on('error', () => {}); // suppress broken pipe
+
         ff.stdin.write(inputBuffer);
         ff.stdin.end();
     });
 }
 
+/**
+ * Fetch sound file from Supabase Storage and decode to PCM Int16 at 24kHz
+ * Results are cached in memory so each sound is only downloaded once per server lifetime
+ */
 async function loadSoundPCM(soundId) {
-    if (soundCache[soundId]) { console.log(`Sound cache hit: ${soundId}`); return soundCache[soundId]; }
+    if (soundCache[soundId]) {
+        console.log(`Sound cache hit: ${soundId}`);
+        return soundCache[soundId];
+    }
+
     const url = BACKGROUND_SOUND_URLS[soundId];
-    if (!url) { console.log(`Unknown sound id: ${soundId}`); return null; }
+    if (!url) {
+        console.log(`Unknown sound id: ${soundId}`);
+        return null;
+    }
+
     try {
-        console.log(`Fetching background sound: ${soundId}`);
+        console.log(`Fetching background sound: ${soundId} from ${url}`);
         const response = await fetch(url);
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        if (!response.ok) throw new Error(`HTTP ${response.status} for sound ${soundId}`);
+
         const audioBuffer = Buffer.from(await response.arrayBuffer());
+        console.log(`Sound downloaded: ${soundId} — ${audioBuffer.length} bytes`);
+
         const pcmSamples = await convertAudioToPcm24k(audioBuffer);
         soundCache[soundId] = pcmSamples;
-        console.log(`Sound decoded & cached: ${soundId} — ${pcmSamples.length} samples`);
+        console.log(`Sound decoded & cached: ${soundId} — ${pcmSamples.length} PCM samples at 24kHz`);
         return pcmSamples;
+
     } catch (err) {
         console.error(`Failed to load sound ${soundId}:`, err.message);
         return null;
     }
 }
 
+/**
+ * Mix background sound PCM samples into Gemini's PCM audio output
+ * Both are at 24kHz mono Int16
+ * Sound loops seamlessly using modulo on offset
+ */
 function mixSoundIntoAudio(geminiPcm, soundSamples, soundOffset, volumePct) {
-    if (!soundSamples || soundSamples.length === 0) return { mixed: geminiPcm, newOffset: soundOffset };
+    if (!soundSamples || soundSamples.length === 0) {
+        return { mixed: geminiPcm, newOffset: soundOffset };
+    }
+
     const vol = Math.max(0, Math.min(100, volumePct)) / 100;
     const mixed = new Int16Array(geminiPcm.length);
     let offset = soundOffset;
+
     for (let i = 0; i < geminiPcm.length; i++) {
-        const bgSample = soundSamples[offset % soundSamples.length];
-        const mixedVal = geminiPcm[i] + Math.round(bgSample * vol);
+        const bgSample = soundSamples[offset % soundSamples.length]; // seamless loop
+        const gemSample = geminiPcm[i];
+        // Mix and clamp to Int16 range [-32768, 32767]
+        const mixedVal = gemSample + Math.round(bgSample * vol);
         mixed[i] = Math.max(-32768, Math.min(32767, mixedVal));
         offset++;
     }
+
     return { mixed, newOffset: offset };
 }
 
 // ─── Supabase helpers ─────────────────────────────────────────────────────────
 
 async function createCallRecord({ businessId, contactId, direction, twilioCallSid }) {
-    const { data, error } = await supabase.from('calls').insert({
-        business_id: businessId || null,
-        contact_id: contactId || null,
-        direction,
-        status: 'in-progress',
-        twilio_call_sid: twilioCallSid || null,
-        started_at: new Date().toISOString()
-    }).select().single();
+    const { data, error } = await supabase
+        .from('calls')
+        .insert({
+            business_id: businessId || null,
+            contact_id: contactId || null,
+            direction,
+            status: 'in-progress',
+            twilio_call_sid: twilioCallSid || null,
+            started_at: new Date().toISOString()
+        })
+        .select()
+        .single();
     if (error) { console.error('Error creating call record:', error.message); return null; }
     console.log(`Call record created: ${data.id}`);
     return data.id;
@@ -236,14 +267,17 @@ async function createCallRecord({ businessId, contactId, direction, twilioCallSi
 
 async function updateCallRecord(callId, { status, callerTranscript, geminiTranscript, durationSeconds, summary }) {
     if (!callId) return;
-    const { error } = await supabase.from('calls').update({
-        status,
-        caller_transcript: callerTranscript || null,
-        gemini_transcript: geminiTranscript || null,
-        duration_seconds: durationSeconds || 0,
-        summary: summary || null,
-        ended_at: new Date().toISOString()
-    }).eq('id', callId);
+    const { error } = await supabase
+        .from('calls')
+        .update({
+            status,
+            caller_transcript: callerTranscript || null,
+            gemini_transcript: geminiTranscript || null,
+            duration_seconds: durationSeconds || 0,
+            summary: summary || null,
+            ended_at: new Date().toISOString()
+        })
+        .eq('id', callId);
     if (error) console.error('Error updating call record:', error.message);
     else console.log(`Call record updated: ${callId} — ${status}`);
 }
@@ -259,7 +293,8 @@ async function checkCallLimit(businessId) {
     const { data, error } = await supabase.from('businesses').select('plan, calls_used_this_month').eq('id', businessId).single();
     if (error || !data) return true;
     const limits = { free: 50, starter: 500, pro: 2000, enterprise: Infinity };
-    if (data.calls_used_this_month >= (limits[data.plan] || 50)) {
+    const limit = limits[data.plan] || 50;
+    if (data.calls_used_this_month >= limit) {
         console.log(`Business ${businessId} reached ${data.plan} plan limit`);
         return false;
     }
@@ -289,6 +324,7 @@ async function generateCallSummary(callerTranscript, geminiTranscript) {
                 })
             }
         );
+        console.log('Summary API response status:', response.status);
         const responseText = await response.text();
         const data = JSON.parse(responseText);
         if (data.error) { console.error('Gemini summary API error:', data.error.message); return null; }
@@ -325,8 +361,10 @@ fastify.all('/incoming-call', async (request, reply) => {
 fastify.post('/make-call', async (request, reply) => {
     const { to, businessId, contactId, agentId } = request.body;
     if (!to) return reply.status(400).send({ error: 'Missing "to" phone number' });
+
     const withinLimit = await checkCallLimit(businessId);
     if (!withinLimit) return reply.status(403).send({ error: 'Monthly call limit reached. Please upgrade your plan.' });
+
     try {
         const credentials = Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString('base64');
         const webhookUrl = new URL(`https://${request.headers.host}/incoming-call`);
@@ -334,6 +372,7 @@ fastify.post('/make-call', async (request, reply) => {
         if (contactId) webhookUrl.searchParams.set('contactId', contactId);
         if (agentId) webhookUrl.searchParams.set('agentId', agentId);
         webhookUrl.searchParams.set('direction', 'outbound');
+
         const response = await fetch(
             `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Calls.json`,
             {
@@ -342,14 +381,17 @@ fastify.post('/make-call', async (request, reply) => {
                 body: new URLSearchParams({ To: to, From: TWILIO_PHONE_NUMBER, Url: webhookUrl.toString() }).toString()
             }
         );
+
         const data = await response.json();
         if (data.sid) {
             console.log(`Outbound call initiated: ${data.sid} → ${to}`);
             reply.send({ success: true, callSid: data.sid, to });
         } else {
+            console.error('Twilio error:', data);
             reply.status(500).send({ success: false, error: data.message || 'Failed to initiate call' });
         }
     } catch (err) {
+        console.error('Error making outbound call:', err);
         reply.status(500).send({ success: false, error: err.message });
     }
 });
@@ -360,6 +402,7 @@ fastify.register(async (fastify) => {
     fastify.get('/media-stream', { websocket: true }, (connection, req) => {
         console.log('Twilio client connected');
 
+        // Per-connection state
         let streamSid = null;
         let latestMediaTimestamp = 0;
         let markQueue = [];
@@ -371,19 +414,13 @@ fastify.register(async (fastify) => {
         let accumulatedText = '';
         let agentPromptOverride = null;
         let agentVoiceOverride = null;
-        let agentLanguage = 'english';
+        let soundPumpInterval = null;  // interval for continuous background sound
+        let isSpeaking = false;        // true when Gemini is actively sending audio
 
         // Background sound state
-        let soundSamples = null;
-        let soundOffset = 0;
-        let soundVolume = 30;
-        let soundPumpInterval = null;
-        let isSpeaking = false;
-
-        // Filler word state
-        let silenceTimer = null;           // triggers filler after N seconds of silence
-        let fillerSent = false;            // prevent multiple fillers at once
-        const FILLER_SILENCE_MS = 2500;    // send filler after 2.5s of silence
+        let soundSamples = null;   // Int16Array of decoded PCM at 24kHz
+        let soundOffset = 0;       // current playback position (loops)
+        let soundVolume = 30;      // 0-100
 
         // Call tracking
         let callId = null;
@@ -394,91 +431,21 @@ fastify.register(async (fastify) => {
         let callerTranscriptParts = [];
         let geminiTranscriptParts = [];
 
-        // ── Continuous background sound pump ──
-        const startSoundPump = () => {
-            if (!soundSamples || soundPumpInterval) return;
-            const CHUNK_24K = 480;  // 20ms at 24kHz
-            const CHUNK_8K  = 160;  // 20ms at 8kHz
-
-            soundPumpInterval = setInterval(() => {
-                if (!streamSid || callEnded || isSpeaking) return;
-                try {
-                    const chunk = new Int16Array(CHUNK_24K);
-                    const vol = soundVolume / 100;
-                    for (let i = 0; i < CHUNK_24K; i++) {
-                        chunk[i] = Math.round(soundSamples[soundOffset % soundSamples.length] * vol);
-                        soundOffset++;
-                    }
-                    const mulaw8k = Buffer.alloc(CHUNK_8K);
-                    for (let i = 0; i < CHUNK_8K; i++) {
-                        mulaw8k[i] = linearToMulaw(Math.max(-32768, Math.min(32767, chunk[i * 3])));
-                    }
-                    if (connection.readyState === WebSocket.OPEN) {
-                        connection.send(JSON.stringify({ event: 'media', streamSid, media: { payload: mulaw8k.toString('base64') } }));
-                    }
-                } catch (err) {
-                    console.error('Sound pump error:', err.message);
-                }
-            }, 20);
-            console.log('Background sound pump started');
-        };
-
-        const stopSoundPump = () => {
-            if (soundPumpInterval) { clearInterval(soundPumpInterval); soundPumpInterval = null; }
-        };
-
-        // ── Filler word helpers ──
-        const getRandomFiller = () => {
-            const lang = agentLanguage?.toLowerCase() || 'english';
-            const phrases = FILLER_PHRASES[lang] || FILLER_PHRASES['english'];
-            return phrases[Math.floor(Math.random() * phrases.length)];
-        };
-
-        const sendFillerWord = () => {
-            if (!geminiReady || callEnded || isSpeaking || fillerSent) return;
-            fillerSent = true;
-            const filler = getRandomFiller();
-            console.log(`Sending filler word: "${filler}"`);
-            if (geminiWs.readyState === WebSocket.OPEN) {
-                geminiWs.send(JSON.stringify({
-                    client_content: {
-                        turns: [{
-                            role: 'user',
-                            parts: [{ text: `[INTERNAL INSTRUCTION - DO NOT REPEAT THIS] Say only this short filler sound naturally as if thinking: "${filler}" — just that, nothing more.` }]
-                        }],
-                        turn_complete: true
-                    }
-                }));
-            }
-        };
-
-        const resetSilenceTimer = () => {
-            if (silenceTimer) { clearTimeout(silenceTimer); silenceTimer = null; }
-            fillerSent = false;
-        };
-
-        const startSilenceTimer = () => {
-            resetSilenceTimer();
-            if (!callEnded && geminiReady) {
-                silenceTimer = setTimeout(sendFillerWord, FILLER_SILENCE_MS);
-            }
-        };
-
         // ── End the call gracefully ──
         const endCall = async (reason = 'timeout') => {
             if (callEnded && reason !== 'timeout' && reason !== 'caller_hung_up') return;
             if (callTimer) { clearTimeout(callTimer); callTimer = null; }
-            resetSilenceTimer();
             console.log(`Ending call. Reason: ${reason}`);
 
             if (reason === 'timeout' && geminiWs.readyState === WebSocket.OPEN && geminiReady) {
                 callEnded = true;
-                geminiWs.send(JSON.stringify({
+                const goodbyeMsg = {
                     client_content: {
                         turns: [{ role: 'user', parts: [{ text: '[INTERNAL INSTRUCTION - DO NOT READ ALOUD] End the call now naturally as an Indian caller who suddenly needs to leave. Keep it very short, casual, and human. Do not mention time limits. Append [END_CALL] at the end of your text response.' }] }],
                         turn_complete: true
                     }
-                }));
+                };
+                geminiWs.send(JSON.stringify(goodbyeMsg));
             } else {
                 callEnded = true;
                 stopSoundPump();
@@ -493,7 +460,11 @@ fastify.register(async (fastify) => {
             const durationSeconds = callStartTime ? Math.floor((Date.now() - callStartTime) / 1000) : 0;
             const callerTranscript = callerTranscriptParts.join('\n') || null;
             const geminiTranscript = geminiTranscriptParts.join('\n') || null;
+
             console.log('--- SAVING CALL TO DATABASE ---');
+            console.log('Caller transcript parts:', callerTranscriptParts.length);
+            console.log('Gemini transcript parts:', geminiTranscriptParts.length);
+
             const summary = await generateCallSummary(callerTranscript, geminiTranscript);
             await updateCallRecord(callId, { status: 'completed', callerTranscript, geminiTranscript, durationSeconds, summary });
             await incrementBusinessCallCount(businessId);
@@ -517,7 +488,7 @@ Additionally follow these natural conversation rules:
                 : SYSTEM_MESSAGE;
 
             const finalVoice = agentVoiceOverride || VOICE;
-            geminiWs.send(JSON.stringify({
+            const setupMsg = {
                 setup: {
                     model: `models/${MODEL}`,
                     generation_config: {
@@ -528,51 +499,25 @@ Additionally follow these natural conversation rules:
                     output_audio_transcription: {},
                     system_instruction: { parts: [{ text: finalPrompt }] }
                 }
-            }));
-            console.log('Gemini session initialized | Voice:', finalVoice);
+            };
+            console.log('Sending Gemini setup with voice:', finalVoice);
+            geminiWs.send(JSON.stringify(setupMsg));
         };
 
-        // ── Smart greeting based on call direction and language ──
         const sendInitialGreeting = () => {
-            const lang = agentLanguage?.toLowerCase() || 'english';
-            let greetInstruction;
-
-            if (direction === 'outbound') {
-                // Outbound: agent called the person — introduce yourself and state purpose
-                const outboundGreetings = {
-                    english:  'You have called this person. Greet them like a real outbound caller — say hello, introduce yourself briefly, and state why you are calling. Keep it short and natural.',
-                    hindi:    'Aapne is vyakti ko call kiya hai. Hindi mein naturally greet karo — apna naam batao aur call ka reason batao. Chhota aur natural rakho.',
-                    hinglish: 'You have called this person. Greet them in Hinglish — mix Hindi and English naturally, introduce yourself and state why you are calling. Keep it short.',
-                    telugu:   'Mీరు ఈ వ్యక్తిని call చేశారు. Telugu లో naturally greet చేయండి — మీ పేరు చెప్పి, call చేసిన కారణం చెప్పండి. చిన్నగా మరియు natural గా ఉండండి.',
-                    tamil:    'நீங்கள் இந்த நபரை அழைத்தீர்கள். Tamil இல் இயற்கையாக வாழ்த்துங்கள் — உங்கள் பெயரை சொல்லி, ஏன் அழைத்தீர்கள் என்று சொல்லுங்கள்.',
-                    kannada:  'Nೀವು ಈ ವ್ಯಕ್ತಿಗೆ call ಮಾಡಿದ್ದೀರಿ. Kannada ನಲ್ಲಿ naturally greet ಮಾಡಿ — ನಿಮ್ಮ ಹೆಸರು ಹೇಳಿ ಮತ್ತು call ಮಾಡಿದ ಕಾರಣ ಹೇಳಿ.',
-                };
-                greetInstruction = outboundGreetings[lang] || outboundGreetings['english'];
-            } else {
-                // Inbound: person called the agent — receive the call warmly
-                const inboundGreetings = {
-                    english:  'Someone has called you. Answer like a real person receiving an inbound call — say hello warmly, mention your name or company if relevant, and ask how you can help. Keep it natural and short.',
-                    hindi:    'Kisi ne aapko call kiya hai. Ek real inbound call ki tarah receive karo — warmly hello bolo, apna naam/company batao aur poochho kaise help kar sakte ho.',
-                    hinglish: 'Someone called you. Receive it in Hinglish — say hello warmly mixing Hindi and English, mention who you are, and ask how you can help.',
-                    telugu:   'మీకు ఎవరో call చేశారు. Inbound call లా receive చేయండి — warmly hello చెప్పి, మీరు ఎవరో చెప్పి, ఎలా help చేయగలరో అడగండి.',
-                    tamil:    'யாரோ உங்களை அழைத்தார்கள். Inbound call போல் பதில் சொல்லுங்கள் — warmly வாழ்த்துங்கள், நீங்கள் யார் என்று சொல்லுங்கள், எப்படி உதவலாம் என்று கேளுங்கள்.',
-                    kannada:  'ಯಾರೋ ನಿಮಗೆ call ಮಾಡಿದ್ದಾರೆ. Inbound call ತರಹ receive ಮಾಡಿ — warmly hello ಹೇಳಿ, ನೀವು ಯಾರು ಎಂದು ಹೇಳಿ, ಹೇಗೆ help ಮಾಡಬಹುದು ಎಂದು ಕೇಳಿ.',
-                };
-                greetInstruction = inboundGreetings[lang] || inboundGreetings['english'];
-            }
-
-            console.log(`Sending ${direction} greeting in ${lang}`);
-            geminiWs.send(JSON.stringify({
+            const greetMsg = {
                 client_content: {
-                    turns: [{ role: 'user', parts: [{ text: greetInstruction }] }],
+                    turns: [{ role: 'user', parts: [{ text: 'Greet the user with a short, friendly welcome message and ask how you can help.' }] }],
                     turn_complete: true
                 }
-            }));
+            };
+            geminiWs.send(JSON.stringify(greetMsg));
         };
 
         const handleInterruption = () => {
             if (markQueue.length > 0 && responseStartTimestampTwilio != null) {
-                console.log(`Interruption detected.`);
+                const elapsedTime = latestMediaTimestamp - responseStartTimestampTwilio;
+                console.log(`Interruption detected. Elapsed: ${elapsedTime}ms`);
                 connection.send(JSON.stringify({ event: 'clear', streamSid }));
                 markQueue = [];
                 lastAssistantMark = null;
@@ -588,6 +533,65 @@ Additionally follow these natural conversation rules:
             }
         };
 
+        // ── Continuous background sound pump ──
+// Sends background sound to Twilio continuously even during silence gaps
+const startSoundPump = () => {
+    if (!soundSamples || soundPumpInterval) return;
+
+    // Send ~20ms of audio every 20ms (matches Twilio's media stream cadence)
+    // At 8kHz mulaw: 20ms = 160 samples
+    const CHUNK_SIZE_8K = 160; // 160 mulaw samples = 20ms at 8kHz
+
+    // We need background sound at 8kHz mulaw for Twilio
+    // soundSamples is at 24kHz — so 20ms at 24kHz = 480 samples
+    const CHUNK_SIZE_24K = 480;
+
+    soundPumpInterval = setInterval(() => {
+        if (!streamSid || callEnded) return;
+        if (isSpeaking) return; // skip — Gemini is handling audio output with mixing
+
+        try {
+            // Get next chunk of background sound at 24kHz
+            const chunk = new Int16Array(CHUNK_SIZE_24K);
+            const vol = soundVolume / 100;
+
+            for (let i = 0; i < CHUNK_SIZE_24K; i++) {
+                chunk[i] = Math.round(soundSamples[soundOffset % soundSamples.length] * vol);
+                soundOffset++;
+            }
+
+            // Downsample 24kHz → 8kHz (pick every 3rd sample) and convert to mulaw
+            const mulaw8k = Buffer.alloc(CHUNK_SIZE_8K);
+            for (let i = 0; i < CHUNK_SIZE_8K; i++) {
+                mulaw8k[i] = linearToMulaw(Math.max(-32768, Math.min(32767, chunk[i * 3])));
+            }
+
+            const payload = mulaw8k.toString('base64');
+            if (connection.readyState === WebSocket.OPEN) {
+                connection.send(JSON.stringify({
+                    event: 'media',
+                    streamSid,
+                    media: { payload }
+                }));
+            }
+        } catch (err) {
+            console.error('Sound pump error:', err.message);
+        }
+    }, 20); // every 20ms
+
+    console.log('Background sound pump started');
+};
+
+const stopSoundPump = () => {
+    if (soundPumpInterval) {
+        clearInterval(soundPumpInterval);
+        soundPumpInterval = null;
+        console.log('Background sound pump stopped');
+    }
+};
+
+
+
         geminiWs.on('open', () => {
             console.log('Connected to Gemini Live API');
         });
@@ -600,8 +604,6 @@ Additionally follow these natural conversation rules:
                     console.log('Gemini session ready');
                     geminiReady = true;
                     sendInitialGreeting();
-                    // Start silence timer after greeting
-                    setTimeout(() => startSilenceTimer(), 3000);
                     return;
                 }
 
@@ -610,24 +612,18 @@ Additionally follow these natural conversation rules:
 
                     if (sc.interrupted) {
                         console.log('Gemini signalled interruption');
-                        isSpeaking = false;
                         handleInterruption();
-                        startSilenceTimer(); // restart silence detection
                         return;
                     }
 
                     if (sc.inputTranscription?.text) {
-                        const text = sc.inputTranscription.text;
-                        console.log(`Caller said: "${text}"`);
-                        callerTranscriptParts.push(`Caller: ${text}`);
-                        // User spoke — reset silence timer
-                        resetSilenceTimer();
+                        console.log(`Caller said: "${sc.inputTranscription.text}"`);
+                        callerTranscriptParts.push(`Caller: ${sc.inputTranscription.text}`);
                     }
 
                     if (sc.outputTranscription?.text) {
-                        const text = sc.outputTranscription.text;
-                        console.log(`Gemini said: "${text}"`);
-                        geminiTranscriptParts.push(`AI: ${text}`);
+                        console.log(`Gemini said: "${sc.outputTranscription.text}"`);
+                        geminiTranscriptParts.push(`AI: ${sc.outputTranscription.text}`);
                     }
 
                     if (sc.modelTurn?.parts) {
@@ -645,11 +641,10 @@ Additionally follow these natural conversation rules:
                                 const mimeType = part.inlineData.mimeType || '';
                                 if (mimeType.startsWith('audio/pcm') || mimeType === 'audio/pcm;rate=24000') {
                                     isSpeaking = true;
-                                    resetSilenceTimer(); // AI is speaking — no filler needed
 
                                     let audioBase64 = part.inlineData.data;
 
-                                    // Mix background sound into Gemini audio
+                                    // ── Mix background sound if agent has one ──
                                     if (soundSamples && soundSamples.length > 0) {
                                         try {
                                             const pcmBuf = Buffer.from(audioBase64, 'base64');
@@ -659,11 +654,13 @@ Additionally follow these natural conversation rules:
                                             audioBase64 = Buffer.from(mixed.buffer).toString('base64');
                                         } catch (mixErr) {
                                             console.error('Sound mixing error:', mixErr.message);
+                                            // Fall through — send unmixed audio rather than dropping it
                                         }
                                     }
 
                                     const mulawPayload = pcm16Base64ToMulawBase64(audioBase64);
                                     connection.send(JSON.stringify({ event: 'media', streamSid, media: { payload: mulawPayload } }));
+
                                     if (!responseStartTimestampTwilio) responseStartTimestampTwilio = latestMediaTimestamp;
                                     sendMark();
                                 }
@@ -674,19 +671,13 @@ Additionally follow these natural conversation rules:
                     if (sc.turnComplete) {
                         console.log('Gemini turn complete');
                         isSpeaking = false;
-
                         if (callEnded) {
                             console.log('Goodbye audio finished, saving and ending call');
-                            stopSoundPump();
-                            resetSilenceTimer();
                             setTimeout(async () => {
                                 await saveCallToDatabase('user_intent');
                                 if (connection.readyState === WebSocket.OPEN) connection.close();
                                 if (geminiWs.readyState === WebSocket.OPEN) geminiWs.close();
                             }, 500);
-                        } else {
-                            // AI finished speaking — start silence timer for filler words
-                            startSilenceTimer();
                         }
                         accumulatedText = '';
                     }
@@ -712,26 +703,31 @@ Additionally follow these natural conversation rules:
                         direction = params.direction || 'inbound';
                         const agentId = params.agentId || null;
 
+                        // Fetch agent and load background sound
                         if (agentId) {
                             const agent = await getAgentById(agentId);
                             if (agent) {
                                 agentPromptOverride = agent.prompt;
                                 agentVoiceOverride = agent.voice;
-                                agentLanguage = agent.language || 'english';
-                                console.log(`Using agent: ${agent.name} | Voice: ${agent.voice} | Language: ${agentLanguage}`);
+                                console.log(`Using agent: ${agent.name} | Voice: ${agent.voice}`);
 
+                                // Load background sound if configured
                                 if (agent.background_sound && agent.background_sound !== 'none') {
                                     soundVolume = agent.sound_volume ?? 30;
+                                    console.log(`Loading background sound: ${agent.background_sound} at ${soundVolume}% volume`);
                                     soundSamples = await loadSoundPCM(agent.background_sound);
                                     if (soundSamples) {
-                                        console.log(`Background sound ready: ${agent.background_sound}`);
+                                        console.log(`Background sound ready: ${agent.background_sound} — ${soundSamples.length} samples`);
                                         startSoundPump();
+                                    } else {
+                                        console.log(`Background sound failed to load — call continues without sound`);
                                     }
                                 }
                             }
                         }
 
-                        console.log(`Stream: ${streamSid} | Direction: ${direction} | Sound: ${soundSamples ? 'loaded' : 'none'}`);
+                        console.log(`Stream: ${streamSid} | Business: ${businessId} | Direction: ${direction}`);
+                        console.log(`Agent: ${agentPromptOverride ? 'custom' : 'default'} | Voice: ${agentVoiceOverride || 'default'} | Sound: ${soundSamples ? 'loaded' : 'none'}`);
 
                         if (geminiWs.readyState === WebSocket.OPEN) {
                             setTimeout(initializeGeminiSession, 100);
@@ -779,7 +775,6 @@ Additionally follow these natural conversation rules:
         connection.on('close', () => {
             console.log('Twilio client disconnected');
             stopSoundPump();
-            resetSilenceTimer();
             endCall('connection_closed');
         });
 
@@ -788,7 +783,10 @@ Additionally follow these natural conversation rules:
     });
 });
 
+// ─── Start server ─────────────────────────────────────────────────────────────
+
 fastify.listen({ port: PORT, host: '0.0.0.0' }, (err) => {
     if (err) { console.error(err); process.exit(1); }
     console.log(`Server is listening on port ${PORT}`);
 });
+
