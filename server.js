@@ -239,16 +239,6 @@ async function incrementBusinessCallCount(businessId) {
     if (error) console.error('Error incrementing call count:', error.message);
 }
 
-async function checkCallLimit(businessId) {
-    if (!businessId) return true;
-    const { data, error } = await supabase.from('businesses').select('plan, calls_used_this_month').eq('id', businessId).single();
-    if (error || !data) return true;
-    const limits = { free: 50, starter: 500, pro: 2000, enterprise: Infinity };
-    const limit = limits[data.plan] || 50;
-    if (data.calls_used_this_month >= limit) return false;
-    return true;
-}
-
 async function getAgentById(agentId) {
     if (!agentId) return null;
     const { data, error } = await supabase.from('agents').select('*').eq('id', agentId).single();
@@ -304,17 +294,18 @@ fastify.post('/make-call', async (request, reply) => {
     if (!to) return reply.status(400).send({ error: 'Missing "to" phone number' });
     if (!businessId) return reply.status(400).send({ error: 'Missing business ID' });
 
-    const withinLimit = await checkCallLimit(businessId);
-    if (!withinLimit) return reply.status(403).send({ error: 'Monthly call limit reached. Please upgrade your plan.' });
-
     const { data: businessData, error: dbError } = await supabase
         .from('businesses')
-        .select('twilio_account_sid, twilio_auth_token, twilio_number')
+        .select('twilio_account_sid, twilio_auth_token, twilio_number, credits_balance')
         .eq('id', businessId)
         .single();
 
     if (dbError || !businessData) {
         return reply.status(500).send({ error: 'Failed to retrieve business profile.' });
+    }
+
+    if (businessData.credits_balance <= 0) {
+        return reply.status(402).send({ error: 'Insufficient credits. Please top up your balance.' });
     }
 
     if (!businessData.twilio_account_sid || !businessData.twilio_auth_token || !businessData.twilio_number) {
@@ -420,6 +411,14 @@ fastify.register(async (fastify) => {
             const summary = await generateCallSummary(callerTranscript, geminiTranscript);
             await updateCallRecord(callId, { status: 'completed', callerTranscript, geminiTranscript, durationSeconds, summary });
             await incrementBusinessCallCount(businessId);
+
+            const minutesUsed = Math.ceil(durationSeconds / 60);
+            if (minutesUsed > 0) {
+                await supabase.rpc('subtract_credits', { 
+                    business_id_input: businessId, 
+                    amount_to_subtract: minutesUsed 
+                });
+            }
         };
 
         const geminiWs = new WebSocket(GEMINI_WS_URL);
