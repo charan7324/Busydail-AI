@@ -6,20 +6,15 @@ import fastifyWs from '@fastify/websocket';
 import { createClient } from '@supabase/supabase-js';
 import { spawn } from 'child_process';
 
-// Load environment variables from .env file
 dotenv.config();
 
 const {
     GEMINI_API_KEY,
-    TWILIO_ACCOUNT_SID,
-    TWILIO_AUTH_TOKEN,
-    TWILIO_PHONE_NUMBER,
     SUPABASE_URL,
     SUPABASE_SERVICE_KEY
 } = process.env;
 
 if (!GEMINI_API_KEY) { console.error('Missing GEMINI_API_KEY'); process.exit(1); }
-if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !TWILIO_PHONE_NUMBER) { console.error('Missing Twilio credentials'); process.exit(1); }
 if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) { console.error('Missing Supabase credentials'); process.exit(1); }
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
@@ -28,7 +23,6 @@ const fastify = Fastify();
 fastify.register(fastifyFormBody);
 fastify.register(fastifyWs);
 
-// CORS
 fastify.addHook('onRequest', (request, reply, done) => {
     reply.header('Access-Control-Allow-Origin', '*');
     reply.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -36,8 +30,6 @@ fastify.addHook('onRequest', (request, reply, done) => {
     if (request.method === 'OPTIONS') { reply.code(200).send(); return; }
     done();
 });
-
-// ─── Constants ────────────────────────────────────────────────────────────────
 
 const SYSTEM_MESSAGE = `You are a real Indian human caller speaking naturally over a phone call.
 Your goal is to sound completely human, casual, and natural — not like an AI assistant.
@@ -96,8 +88,6 @@ const BACKGROUND_SOUND_URLS = {
 
 const soundCache = {};
 
-// ─── Audio conversion helpers ─────────────────────────────────────────────────
-
 function mulawToLinear(u) {
     u = ~u & 0xFF;
     let sign = u & 0x80;
@@ -147,8 +137,6 @@ function pcm16Base64ToMulawBase64(pcm16Base64) {
     return mulaw8k.toString('base64');
 }
 
-// ─── Background Sound helpers ─────────────────────────────────────────────────
-
 function convertAudioToPcm24k(inputBuffer) {
     return new Promise((resolve, reject) => {
         const chunks = [];
@@ -181,10 +169,8 @@ async function loadSoundPCM(soundId) {
     if (!url) return null;
 
     try {
-        console.log(`Fetching background sound: ${soundId} from ${url}`);
         const response = await fetch(url);
         if (!response.ok) throw new Error(`HTTP ${response.status} for sound ${soundId}`);
-
         const audioBuffer = Buffer.from(await response.arrayBuffer());
         const pcmSamples = await convertAudioToPcm24k(audioBuffer);
         soundCache[soundId] = pcmSamples;
@@ -212,8 +198,6 @@ function mixSoundIntoAudio(geminiPcm, soundSamples, soundOffset, volumePct) {
     }
     return { mixed, newOffset: offset };
 }
-
-// ─── Supabase helpers ─────────────────────────────────────────────────────────
 
 async function createCallRecord({ businessId, contactId, direction, twilioCallSid, maxDurationLimit }) {
     const { data, error } = await supabase
@@ -295,8 +279,6 @@ async function generateCallSummary(callerTranscript, geminiTranscript) {
     }
 }
 
-// ─── Routes ───────────────────────────────────────────────────────────────────
-
 fastify.get('/', async (request, reply) => {
     reply.send({ message: 'Twilio + Gemini Live API Media Stream Server is running!' });
 });
@@ -320,25 +302,51 @@ fastify.all('/incoming-call', async (request, reply) => {
 fastify.post('/make-call', async (request, reply) => {
     const { to, businessId, contactId, agentId, maxDuration } = request.body;
     if (!to) return reply.status(400).send({ error: 'Missing "to" phone number' });
+    if (!businessId) return reply.status(400).send({ error: 'Missing business ID' });
 
     const withinLimit = await checkCallLimit(businessId);
     if (!withinLimit) return reply.status(403).send({ error: 'Monthly call limit reached. Please upgrade your plan.' });
 
+    const { data: businessData, error: dbError } = await supabase
+        .from('businesses')
+        .select('twilio_account_sid, twilio_auth_token, twilio_number')
+        .eq('id', businessId)
+        .single();
+
+    if (dbError || !businessData) {
+        return reply.status(500).send({ error: 'Failed to retrieve business profile.' });
+    }
+
+    if (!businessData.twilio_account_sid || !businessData.twilio_auth_token || !businessData.twilio_number) {
+        return reply.status(400).send({ error: 'Twilio credentials not configured. Please update your Settings.' });
+    }
+
+    const userTwilioSid = businessData.twilio_account_sid.trim();
+    const userTwilioAuth = businessData.twilio_auth_token.trim();
+    const userTwilioNumber = businessData.twilio_number.trim();
+
     try {
-        const credentials = Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString('base64');
+        const credentials = Buffer.from(`${userTwilioSid}:${userTwilioAuth}`).toString('base64');
         const webhookUrl = new URL(`https://${request.headers.host}/incoming-call`);
-        if (businessId) webhookUrl.searchParams.set('businessId', businessId);
+        webhookUrl.searchParams.set('businessId', businessId);
         if (contactId) webhookUrl.searchParams.set('contactId', contactId);
         if (agentId) webhookUrl.searchParams.set('agentId', agentId);
         webhookUrl.searchParams.set('maxDuration', maxDuration || '120');
         webhookUrl.searchParams.set('direction', 'outbound');
 
         const response = await fetch(
-            `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Calls.json`,
+            `https://api.twilio.com/2010-04-01/Accounts/${userTwilioSid}/Calls.json`,
             {
                 method: 'POST',
-                headers: { 'Authorization': `Basic ${credentials}`, 'Content-Type': 'application/x-www-form-urlencoded' },
-                body: new URLSearchParams({ To: to, From: TWILIO_PHONE_NUMBER, Url: webhookUrl.toString() }).toString()
+                headers: { 
+                    'Authorization': `Basic ${credentials}`, 
+                    'Content-Type': 'application/x-www-form-urlencoded' 
+                },
+                body: new URLSearchParams({ 
+                    To: to, 
+                    From: userTwilioNumber, 
+                    Url: webhookUrl.toString() 
+                }).toString()
             }
         );
 
@@ -346,19 +354,15 @@ fastify.post('/make-call', async (request, reply) => {
         if (data.sid) {
             reply.send({ success: true, callSid: data.sid, to });
         } else {
-            reply.status(500).send({ success: false, error: data.message || 'Failed to initiate call' });
+            reply.status(500).send({ success: false, error: data.message || 'Failed to initiate call via your Twilio account' });
         }
     } catch (err) {
         reply.status(500).send({ success: false, error: err.message });
     }
 });
 
-// ─── WebSocket: /media-stream ─────────────────────────────────────────────────
-
 fastify.register(async (fastify) => {
     fastify.get('/media-stream', { websocket: true }, (connection, req) => {
-        console.log('Twilio client connected');
-
         let streamSid = null;
         let latestMediaTimestamp = 0;
         let markQueue = [];
@@ -646,9 +650,7 @@ Additionally follow these natural conversation rules:
                         responseStartTimestampTwilio = null;
                         latestMediaTimestamp = 0;
 
-                        // Dynamic timeout limit from dashboard parameters
                         callTimer = setTimeout(() => {
-                            console.log(`Call runtime maximum execution reached: ${maxDurationSec}s`);
                             endCall('timeout');
                         }, maxDurationSec * 1000);
                         break;
@@ -670,9 +672,6 @@ Additionally follow these natural conversation rules:
                     case 'stop':
                         endCall('caller_hung_up');
                         break;
-
-                    default:
-                        console.log('Non-media event:', data.event);
                 }
             } catch (err) {
                 console.error('Error parsing Twilio message:', err);
