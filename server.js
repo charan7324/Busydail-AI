@@ -684,6 +684,44 @@ Additionally follow these natural conversation rules:
     });
 });
 
+
+// --- RAZORPAY PAYMENT VERIFICATION ---
+fastify.post('/verify-payment', async (request, reply) => {
+    const { paymentId, businessId, creditsToAdd } = request.body;
+
+    if (!paymentId || !businessId || !creditsToAdd) {
+        return reply.status(400).send({ success: false, error: 'Missing required fields' });
+    }
+
+    try {
+        // 1. Verify the payment directly with Razorpay using your secret keys
+        const credentials = Buffer.from(`${process.env.RAZORPAY_KEY_ID}:${process.env.RAZORPAY_KEY_SECRET}`).toString('base64');
+        const response = await fetch(`https://api.razorpay.com/v1/payments/${paymentId}`, {
+            headers: { 'Authorization': `Basic ${credentials}` }
+        });
+        const rzpData = await response.json();
+
+        // 2. If Razorpay confirms the money was captured/authorized
+        if (rzpData.status === 'captured' || rzpData.status === 'authorized') {
+            
+            // 3. Securely add the credits to the database
+            const { error } = await supabase.rpc('add_credits', {
+                business_id_input: businessId,
+                amount_to_add: creditsToAdd
+            });
+
+            if (error) throw error;
+
+            return reply.send({ success: true, message: 'Payment verified and credits added.' });
+        } else {
+            return reply.status(400).send({ success: false, error: 'Payment not captured by Razorpay.' });
+        }
+    } catch (err) {
+        console.error('Payment Verification Error:', err);
+        return reply.status(500).send({ success: false, error: err.message });
+    }
+});
+
 fastify.listen({ port: PORT, host: '0.0.0.0' }, (err) => {
     if (err) { console.error(err); process.exit(1); }
     console.log(`Server is listening on port ${PORT}`);
