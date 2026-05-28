@@ -246,6 +246,17 @@ async function getAgentById(agentId) {
     return data;
 }
 
+async function getGroupById(groupId) {
+    if (!groupId) return null;
+    const { data, error } = await supabase
+        .from('ai_groups')
+        .select(`id, name, routing_conditions, primary_agent_id, group_members(agent_id)`)
+        .eq('id', groupId)
+        .single();
+    if (error) return null;
+    return data;
+}
+
 async function generateCallSummary(callerTranscript, geminiTranscript) {
     if (!callerTranscript && !geminiTranscript) return null;
     try {
@@ -282,6 +293,7 @@ fastify.all('/incoming-call', async (request, reply) => {
             <Parameter name="contactId" value="${request.query.contactId || ''}" />
             <Parameter name="direction" value="${request.query.direction || 'inbound'}" />
             <Parameter name="agentId" value="${request.query.agentId || ''}" />
+            <Parameter name="groupId" value="${request.query.groupId || ''}" />
             <Parameter name="maxDuration" value="${request.query.maxDuration || '120'}" />
         </Stream>
     </Connect>
@@ -290,7 +302,7 @@ fastify.all('/incoming-call', async (request, reply) => {
 });
 
 fastify.post('/make-call', async (request, reply) => {
-    const { to, businessId, contactId, agentId, maxDuration } = request.body;
+    const { to, businessId, contactId, agentId, groupId, maxDuration } = request.body;
     if (!to) return reply.status(400).send({ error: 'Missing "to" phone number' });
     if (!businessId) return reply.status(400).send({ error: 'Missing business ID' });
 
@@ -322,6 +334,7 @@ fastify.post('/make-call', async (request, reply) => {
         webhookUrl.searchParams.set('businessId', businessId);
         if (contactId) webhookUrl.searchParams.set('contactId', contactId);
         if (agentId) webhookUrl.searchParams.set('agentId', agentId);
+        if (groupId) webhookUrl.searchParams.set('groupId', groupId);
         webhookUrl.searchParams.set('maxDuration', maxDuration || '120');
         webhookUrl.searchParams.set('direction', 'outbound');
 
@@ -354,20 +367,23 @@ fastify.post('/make-call', async (request, reply) => {
 
 fastify.register(async (fastify) => {
     fastify.get('/media-stream', { websocket: true }, (connection, req) => {
+        
+        let geminiWs = null; // Dynamically swapped during transfers
+        let geminiReady = false;
+        let isTransferring = false;
+        let isTransferContextActive = false;
+
         let streamSid = null;
         let latestMediaTimestamp = 0;
         let markQueue = [];
         let responseStartTimestampTwilio = null;
         let lastAssistantMark = null;
-        let geminiReady = false;
         let callEnded = false;
         let callTimer = null;
         let accumulatedText = '';
-        let agentPromptOverride = null;
-        let agentVoiceOverride = null;
+        
         let soundPumpInterval = null;  
         let isSpeaking = false;        
-
         let soundSamples = null;   
         let soundOffset = 0;       
         let soundVolume = 30;      
@@ -380,11 +396,17 @@ fastify.register(async (fastify) => {
         let callerTranscriptParts = [];
         let geminiTranscriptParts = [];
 
+        // Multi-Agent Architecture State
+        let isGroupCall = false;
+        let groupRoutingConditions = '';
+        let availableAgents = [];
+        let currentAgent = null;
+
         const endCall = async (reason = 'timeout') => {
             if (callEnded && reason !== 'timeout' && reason !== 'caller_hung_up') return;
             if (callTimer) { clearTimeout(callTimer); callTimer = null; }
 
-            if (reason === 'timeout' && geminiWs.readyState === WebSocket.OPEN && geminiReady) {
+            if (reason === 'timeout' && geminiWs && geminiWs.readyState === WebSocket.OPEN && geminiReady) {
                 callEnded = true;
                 const goodbyeMsg = {
                     client_content: {
@@ -398,7 +420,7 @@ fastify.register(async (fastify) => {
                 stopSoundPump();
                 await saveCallToDatabase(reason);
                 if (connection.readyState === WebSocket.OPEN) connection.close();
-                if (geminiWs.readyState === WebSocket.OPEN) geminiWs.close();
+                if (geminiWs && geminiWs.readyState === WebSocket.OPEN) geminiWs.close();
             }
         };
 
@@ -421,72 +443,13 @@ fastify.register(async (fastify) => {
             }
         };
 
-        const geminiWs = new WebSocket(GEMINI_WS_URL);
-
-        const initializeGeminiSession = () => {
-            const finalPrompt = agentPromptOverride
-                ? `${agentPromptOverride}
-
-Additionally follow these natural conversation rules:
-- Use natural fillers: "hmm...", "uh...", "okay...", "actually..."
-- Keep responses VERY SHORT — 1-2 sentences max
-- If user is silent: "hello... are you there?"
-- If user wants to end call: say a warm goodbye and append [END_CALL] at the very end of your text response
-- If you receive internal instruction to end due to time: say casual goodbye and append [END_CALL]
-- Detect end intent from: "bye", "goodbye", "I'll let you go", "I have to go", "call me later", "we're done", "that's all", "I'm busy" etc.
-- The [END_CALL] tag is never spoken — it is only a signal`
-                : SYSTEM_MESSAGE;
-
-            const finalVoice = agentVoiceOverride || VOICE;
-            const setupMsg = {
-                setup: {
-                    model: `models/${MODEL}`,
-                    generation_config: {
-                        response_modalities: ['AUDIO'],
-                        speech_config: { voice_config: { prebuilt_voice_config: { voice_name: finalVoice } } }
-                    },
-                    input_audio_transcription: {},
-                    output_audio_transcription: {},
-                    system_instruction: { parts: [{ text: finalPrompt }] }
-                }
-            };
-            geminiWs.send(JSON.stringify(setupMsg));
-        };
-
-        const sendInitialGreeting = () => {
-            const greetMsg = {
-                client_content: {
-                    turns: [{ role: 'user', parts: [{ text: 'Greet the user with a short, friendly welcome message and ask how you can help.' }] }],
-                    turn_complete: true
-                }
-            };
-            geminiWs.send(JSON.stringify(greetMsg));
-        };
-
-        const handleInterruption = () => {
-            if (markQueue.length > 0 && responseStartTimestampTwilio != null) {
-                connection.send(JSON.stringify({ event: 'clear', streamSid }));
-                markQueue = [];
-                lastAssistantMark = null;
-                responseStartTimestampTwilio = null;
-            }
-        };
-
-        const sendMark = () => {
-            if (streamSid) {
-                connection.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: 'responsePart' } }));
-                markQueue.push('responsePart');
-                lastAssistantMark = 'responsePart';
-            }
-        };
-
         const startSoundPump = () => {
             if (!soundSamples || soundPumpInterval) return;
             const CHUNK_SIZE_8K = 160; 
             const CHUNK_SIZE_24K = 480;
 
             soundPumpInterval = setInterval(() => {
-                if (!streamSid || callEnded) return;
+                if (!streamSid || callEnded || isTransferring) return;
                 if (isSpeaking) return; 
 
                 try {
@@ -520,87 +483,214 @@ Additionally follow these natural conversation rules:
             }
         };
 
-        geminiWs.on('open', () => {});
+        const handleInterruption = () => {
+            if (markQueue.length > 0 && responseStartTimestampTwilio != null) {
+                connection.send(JSON.stringify({ event: 'clear', streamSid }));
+                markQueue = [];
+                lastAssistantMark = null;
+                responseStartTimestampTwilio = null;
+            }
+        };
 
-        geminiWs.on('message', (data) => {
-            try {
-                const msg = JSON.parse(data.toString());
+        const sendMark = () => {
+            if (streamSid) {
+                connection.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: 'responsePart' } }));
+                markQueue.push('responsePart');
+                lastAssistantMark = 'responsePart';
+            }
+        };
 
-                if (msg.setupComplete !== undefined) {
-                    geminiReady = true;
-                    sendInitialGreeting();
-                    return;
+        // Core Gemini WebSocket Bootstrapper (Handles initialization and hot-swapping)
+        const connectGemini = (transferContext = null) => {
+            if (geminiWs && geminiWs.readyState === WebSocket.OPEN) {
+                geminiWs.close(); // Cleanly detach old agent
+            }
+
+            geminiReady = false;
+            geminiWs = new WebSocket(GEMINI_WS_URL);
+
+            geminiWs.on('open', () => {
+                let finalPrompt = currentAgent ? currentAgent.prompt : SYSTEM_MESSAGE;
+                let finalVoice = currentAgent ? currentAgent.voice : VOICE;
+
+                // Inject Routing Instructions and Tools if this is a Team Call
+                if (isGroupCall && availableAgents.length > 0) {
+                    finalPrompt += `\n\n=== MULTI-AGENT ROUTING RULES ===\n${groupRoutingConditions}\n\nYou possess a tool called 'transfer_agent'. When the user's request matches these routing rules, you MUST use the tool to transfer the call immediately. Do not announce the transfer unless explicitly told to in the rules.\n\nAVAILABLE AGENTS:\n`;
+                    availableAgents.forEach(a => {
+                        finalPrompt += `- Name: ${a.name} | ID: ${a.id}\n`;
+                    });
                 }
 
-                if (msg.serverContent) {
-                    const sc = msg.serverContent;
+                // Inject Transfer History so the new agent isn't lost
+                if (transferContext) {
+                    finalPrompt += `\n\n=== CRITICAL CONTEXT ===\nYou have just been hot-swapped into this active phone call. Pick up seamlessly where the last agent left off. Recent transcript:\n${transferContext}`;
+                    isTransferContextActive = true;
+                }
 
-                    if (sc.interrupted) {
-                        handleInterruption();
+                // Standard Human Emulator Prompt Append
+                finalPrompt += `\n\nAdditionally follow these natural conversation rules:\n- Use natural fillers: "hmm...", "uh...", "okay..."\n- Keep responses VERY SHORT — 1-2 sentences max\n- If user is silent: "hello... are you there?"\n- If user wants to end call: say a warm goodbye and append [END_CALL] at the very end of your text response\n- The [END_CALL] tag is never spoken — it is only a signal`;
+
+                const setupMsg = {
+                    setup: {
+                        model: `models/${MODEL}`,
+                        generation_config: {
+                            response_modalities: ['AUDIO'],
+                            speech_config: { voice_config: { prebuilt_voice_config: { voice_name: finalVoice } } }
+                        },
+                        input_audio_transcription: {},
+                        output_audio_transcription: {},
+                        system_instruction: { parts: [{ text: finalPrompt }] }
+                    }
+                };
+
+                // Register Tool if it's a team call
+                if (isGroupCall) {
+                    setupMsg.setup.tools = [{
+                        function_declarations: [{
+                            name: "transfer_agent",
+                            description: "Transfer the active phone call to a different agent/department based on the routing rules.",
+                            parameters: {
+                                type: "OBJECT",
+                                properties: { agent_id: { type: "STRING", description: "The EXACT ID of the target agent from the available agents list." } },
+                                required: ["agent_id"]
+                            }
+                        }]
+                    }];
+                }
+
+                geminiWs.send(JSON.stringify(setupMsg));
+            });
+
+            geminiWs.on('message', (data) => {
+                try {
+                    const msg = JSON.parse(data.toString());
+
+                    // Session Ready
+                    if (msg.setupComplete !== undefined) {
+                        geminiReady = true;
+                        isTransferring = false;
+                        
+                        if (isTransferContextActive) {
+                            // Tell the new agent to acknowledge the transfer
+                            geminiWs.send(JSON.stringify({
+                                client_content: { turns: [{ role: 'user', parts: [{ text: 'You have successfully taken over the call. Acknowledge the user naturally based on your persona and continue helping them.' }] }], turn_complete: true }
+                            }));
+                            isTransferContextActive = false;
+                        } else {
+                            // Standard First Greeting
+                            geminiWs.send(JSON.stringify({
+                                client_content: { turns: [{ role: 'user', parts: [{ text: 'Greet the user with a short, friendly welcome message and ask how you can help.' }] }], turn_complete: true }
+                            }));
+                        }
                         return;
                     }
 
-                    if (sc.inputTranscription?.text) {
-                        callerTranscriptParts.push(`Caller: ${sc.inputTranscription.text}`);
-                    }
+                    if (msg.serverContent) {
+                        const sc = msg.serverContent;
 
-                    if (sc.outputTranscription?.text) {
-                        geminiTranscriptParts.push(`AI: ${sc.outputTranscription.text}`);
-                    }
+                        if (sc.interrupted) {
+                            handleInterruption();
+                            return;
+                        }
 
-                    if (sc.modelTurn?.parts) {
-                        for (const part of sc.modelTurn.parts) {
-                            if (part.text) {
-                                accumulatedText += part.text;
-                                if (accumulatedText.includes('[END_CALL]')) {
-                                    callEnded = true;
-                                }
-                            }
+                        if (sc.inputTranscription?.text) {
+                            callerTranscriptParts.push(`Caller: ${sc.inputTranscription.text}`);
+                        }
 
-                            if (part.inlineData?.data) {
-                                const mimeType = part.inlineData.mimeType || '';
-                                if (mimeType.startsWith('audio/pcm') || mimeType === 'audio/pcm;rate=24000') {
-                                    isSpeaking = true;
-                                    let audioBase64 = part.inlineData.data;
+                        if (sc.outputTranscription?.text) {
+                            geminiTranscriptParts.push(`AI (${currentAgent?.name || 'System'}): ${sc.outputTranscription.text}`);
+                        }
 
-                                    if (soundSamples && soundSamples.length > 0) {
-                                        try {
-                                            const pcmBuf = Buffer.from(audioBase64, 'base64');
-                                            const geminiPcm = new Int16Array(pcmBuf.buffer, pcmBuf.byteOffset, pcmBuf.byteLength / 2);
-                                            const { mixed, newOffset } = mixSoundIntoAudio(geminiPcm, soundSamples, soundOffset, soundVolume);
-                                            soundOffset = newOffset;
-                                            audioBase64 = Buffer.from(mixed.buffer).toString('base64');
-                                        } catch (mixErr) {
-                                            console.error('Sound mixing error:', mixErr.message);
+                        if (sc.modelTurn?.parts) {
+                            for (const part of sc.modelTurn.parts) {
+                                
+                                // === HOT SWAP TRANSFER INTERCEPTOR ===
+                                if (part.functionCall && part.functionCall.name === 'transfer_agent') {
+                                    const targetId = part.functionCall.args.agent_id;
+                                    const targetAgent = availableAgents.find(a => a.id === targetId);
+                                    
+                                    if (targetAgent && targetAgent.id !== currentAgent.id) {
+                                        console.log(`[HOT SWAP] Transferring call from ${currentAgent.name} to ${targetAgent.name}...`);
+                                        isTransferring = true;
+                                        
+                                        // 1. Halt Twilio audio instantly
+                                        connection.send(JSON.stringify({ event: 'clear', streamSid }));
+                                        markQueue = []; 
+                                        
+                                        // 2. Setup New Identity
+                                        currentAgent = targetAgent;
+
+                                        // 3. Update Environment (Background Sound)
+                                        if (targetAgent.background_sound && targetAgent.background_sound !== 'none') {
+                                            soundVolume = targetAgent.sound_volume ?? 30;
+                                            loadSoundPCM(targetAgent.background_sound).then(s => {
+                                                soundSamples = s;
+                                                startSoundPump();
+                                            });
+                                        } else {
+                                            stopSoundPump();
+                                            soundSamples = null;
                                         }
+
+                                        // 4. Restart Gemini with Context
+                                        const history = callerTranscriptParts.slice(-10).join('\n');
+                                        connectGemini(history);
+                                        return; // Immediately exit processing for this old socket
                                     }
+                                }
 
-                                    const mulawPayload = pcm16Base64ToMulawBase64(audioBase64);
-                                    connection.send(JSON.stringify({ event: 'media', streamSid, media: { payload: mulawPayload } }));
+                                if (part.text) {
+                                    accumulatedText += part.text;
+                                    if (accumulatedText.includes('[END_CALL]')) {
+                                        callEnded = true;
+                                    }
+                                }
 
-                                    if (!responseStartTimestampTwilio) responseStartTimestampTwilio = latestMediaTimestamp;
-                                    sendMark();
+                                if (part.inlineData?.data) {
+                                    const mimeType = part.inlineData.mimeType || '';
+                                    if (mimeType.startsWith('audio/pcm') || mimeType === 'audio/pcm;rate=24000') {
+                                        isSpeaking = true;
+                                        let audioBase64 = part.inlineData.data;
+
+                                        if (soundSamples && soundSamples.length > 0) {
+                                            try {
+                                                const pcmBuf = Buffer.from(audioBase64, 'base64');
+                                                const geminiPcm = new Int16Array(pcmBuf.buffer, pcmBuf.byteOffset, pcmBuf.byteLength / 2);
+                                                const { mixed, newOffset } = mixSoundIntoAudio(geminiPcm, soundSamples, soundOffset, soundVolume);
+                                                soundOffset = newOffset;
+                                                audioBase64 = Buffer.from(mixed.buffer).toString('base64');
+                                            } catch (mixErr) {
+                                                console.error('Sound mixing error:', mixErr.message);
+                                            }
+                                        }
+
+                                        const mulawPayload = pcm16Base64ToMulawBase64(audioBase64);
+                                        connection.send(JSON.stringify({ event: 'media', streamSid, media: { payload: mulawPayload } }));
+
+                                        if (!responseStartTimestampTwilio) responseStartTimestampTwilio = latestMediaTimestamp;
+                                        sendMark();
+                                    }
                                 }
                             }
                         }
-                    }
 
-                    if (sc.turnComplete) {
-                        isSpeaking = false;
-                        if (callEnded) {
-                            setTimeout(async () => {
-                                await saveCallToDatabase('user_intent');
-                                if (connection.readyState === WebSocket.OPEN) connection.close();
-                                if (geminiWs.readyState === WebSocket.OPEN) geminiWs.close();
-                            }, 500);
+                        if (sc.turnComplete) {
+                            isSpeaking = false;
+                            if (callEnded) {
+                                setTimeout(async () => {
+                                    await saveCallToDatabase('user_intent');
+                                    if (connection.readyState === WebSocket.OPEN) connection.close();
+                                    if (geminiWs && geminiWs.readyState === WebSocket.OPEN) geminiWs.close();
+                                }, 500);
+                            }
+                            accumulatedText = '';
                         }
-                        accumulatedText = '';
                     }
+                } catch (err) {
+                    console.error('Error processing Gemini message:', err);
                 }
-            } catch (err) {
-                console.error('Error processing Gemini message:', err);
-            }
-        });
+            });
+        };
 
         connection.on('message', async (message) => {
             try {
@@ -616,27 +706,49 @@ Additionally follow these natural conversation rules:
                         contactId = params.contactId || null;
                         direction = params.direction || 'inbound';
                         const agentId = params.agentId || null;
+                        const groupId = params.groupId || null;
                         const maxDurationSec = parseInt(params.maxDuration || '120', 10);
 
-                        if (agentId) {
-                            const agent = await getAgentById(agentId);
-                            if (agent) {
-                                agentPromptOverride = agent.prompt;
-                                agentVoiceOverride = agent.voice;
-
-                                if (agent.background_sound && agent.background_sound !== 'none') {
-                                    soundVolume = agent.sound_volume ?? 30;
-                                    soundSamples = await loadSoundPCM(agent.background_sound);
-                                    if (soundSamples) startSoundPump();
+                        // Multi-Agent Initialization
+                        if (groupId) {
+                            isGroupCall = true;
+                            const groupData = await getGroupById(groupId);
+                            
+                            if (groupData) {
+                                groupRoutingConditions = groupData.routing_conditions;
+                                
+                                // Set Primary Agent
+                                const pAgent = await getAgentById(groupData.primary_agent_id);
+                                if (pAgent) {
+                                    currentAgent = pAgent;
+                                    availableAgents.push(pAgent);
                                 }
+                                
+                                // Load Backup Team Members
+                                for (const member of (groupData.group_members || [])) {
+                                    if (member.agent_id !== groupData.primary_agent_id) {
+                                        const bAgent = await getAgentById(member.agent_id);
+                                        if (bAgent) availableAgents.push(bAgent);
+                                    }
+                                }
+                            }
+                        } else if (agentId) {
+                            // Standard Single Agent Initialization
+                            currentAgent = await getAgentById(agentId);
+                        }
+
+                        // Start Background Ambience for initial agent
+                        if (currentAgent && currentAgent.background_sound && currentAgent.background_sound !== 'none') {
+                            soundVolume = currentAgent.sound_volume ?? 30;
+                            const sSamples = await loadSoundPCM(currentAgent.background_sound);
+                            if (sSamples) {
+                                soundSamples = sSamples;
+                                startSoundPump();
                             }
                         }
 
-                        if (geminiWs.readyState === WebSocket.OPEN) {
-                            setTimeout(initializeGeminiSession, 100);
-                        } else {
-                            geminiWs.once('open', () => setTimeout(initializeGeminiSession, 100));
-                        }
+                        // Boot Up Gemini Session
+                        connectGemini();
 
                         callId = await createCallRecord({ 
                             businessId, 
@@ -656,7 +768,8 @@ Additionally follow these natural conversation rules:
 
                     case 'media':
                         latestMediaTimestamp = data.media.timestamp;
-                        if (geminiWs.readyState === WebSocket.OPEN && geminiReady) {
+                        // Pipe audio to active Gemini instance unless hot-swapping
+                        if (geminiWs && geminiWs.readyState === WebSocket.OPEN && geminiReady && !isTransferring) {
                             const pcm16Payload = mulawBase64ToPcm16Base64(data.media.payload);
                             geminiWs.send(JSON.stringify({
                                 realtime_input: { media_chunks: [{ data: pcm16Payload, mime_type: 'audio/pcm;rate=16000' }] }
@@ -694,24 +807,19 @@ fastify.post('/verify-payment', async (request, reply) => {
     }
 
     try {
-        // 1. Verify the payment directly with Razorpay using your secret keys
         const credentials = Buffer.from(`${process.env.RAZORPAY_KEY_ID}:${process.env.RAZORPAY_KEY_SECRET}`).toString('base64');
         const response = await fetch(`https://api.razorpay.com/v1/payments/${paymentId}`, {
             headers: { 'Authorization': `Basic ${credentials}` }
         });
         const rzpData = await response.json();
 
-        // 2. If Razorpay confirms the money was captured/authorized
         if (rzpData.status === 'captured' || rzpData.status === 'authorized') {
-            
-            // 3. Securely add the credits to the database
             const { error } = await supabase.rpc('add_credits', {
                 business_id_input: businessId,
                 amount_to_add: creditsToAdd
             });
 
             if (error) throw error;
-
             return reply.send({ success: true, message: 'Payment verified and credits added.' });
         } else {
             return reply.status(400).send({ success: false, error: 'Payment not captured by Razorpay.' });
