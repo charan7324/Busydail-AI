@@ -372,7 +372,6 @@ fastify.register(async (fastify) => {
         let geminiReady = false;
         let isTransferring = false;
         let isTransferContextActive = false;
-        let pendingTransferTarget = null; 
 
         let streamSid = null;
         let latestMediaTimestamp = 0;
@@ -502,36 +501,38 @@ fastify.register(async (fastify) => {
         };
 
         // --- MASTER HOT SWAP EXECUTION ENGINE ---
-        const executeHotSwap = (targetId, shouldClearBuffer) => {
-            if (isTransferring) return;
-            
+        // This function is completely divorced from turnComplete to guarantee execution.
+        const executeHotSwap = (targetId) => {
             const targetAgent = availableAgents.find(a => String(a.id).trim() === targetId.trim());
-            if (!targetAgent || targetAgent.id === currentAgent.id) {
-                pendingTransferTarget = null;
+            
+            if (!targetAgent) {
+                console.error(`[HOT SWAP FAIL] Invalid Target ID: ${targetId}. Continuing with current agent.`);
+                isTransferring = false;
+                return;
+            }
+            if (targetAgent.id === currentAgent.id) {
+                console.log(`[SYS] AI attempted to transfer to itself. Ignoring.`);
+                isTransferring = false;
                 return;
             }
 
-            console.log(`[SYS] Executing HOT SWAP from ${currentAgent.name} to ${targetAgent.name}`);
-            isTransferring = true;
-            pendingTransferTarget = null;
+            console.log(`[HOT SWAP] Instantly swapping from ${currentAgent.name} to ${targetAgent.name}`);
 
-            // 1. Terminate old AI connection to stop generation
+            // 1. Kill old Gemini connection to stop it from listening/talking
             if (geminiWs && geminiWs.readyState === WebSocket.OPEN) {
                 geminiWs.close();
             }
 
-            // 2. Conditionally clear buffer (Only clear if interrupted so we don't chop off the transition phrase)
-            if (shouldClearBuffer && connection.readyState === WebSocket.OPEN) {
-                connection.send(JSON.stringify({ event: 'clear', streamSid }));
-            }
+            // WE EXPLICITLY DO NOT SEND { event: 'clear' } TO TWILIO.
+            // This ensures the audio for "Please hold on while I transfer you..." finishes playing on the user's phone!
 
-            // 3. HARD RESET STATE (Crucial step to prevent duplicate firing)
+            // 2. Hard Reset local state for next agent
             isSpeaking = false;
             markQueue = [];
             accumulatedText = '';
             currentAgent = targetAgent;
 
-            // 4. Update Audio Environment
+            // 3. Update Environment (Background Noise)
             if (targetAgent.background_sound && targetAgent.background_sound !== 'none') {
                 soundVolume = targetAgent.sound_volume ?? 30;
                 loadSoundPCM(targetAgent.background_sound).then(s => {
@@ -543,9 +544,9 @@ fastify.register(async (fastify) => {
                 soundSamples = null;
             }
 
-            // 5. Connect new Gemini Instance
+            // 4. Reboot Gemini with Conversation Context
             const history = callerTranscriptParts.slice(-10).join('\n') || "No previous context.";
-            setTimeout(() => { connectGemini(history); }, 100);
+            connectGemini(history);
         };
 
 
@@ -559,9 +560,9 @@ fastify.register(async (fastify) => {
                 let finalPrompt = currentAgent ? currentAgent.prompt : SYSTEM_MESSAGE;
                 let finalVoice = currentAgent ? currentAgent.voice : VOICE;
 
-                // Inject strictly formatted routing rules
+                // Inject Strictly Formatted Routing Instructions
                 if (isGroupCall && availableAgents.length > 0) {
-                    finalPrompt += `\n\n=== MULTI-AGENT ROUTING RULES ===\n${groupRoutingConditions}\n\nIMPORTANT INSTRUCTION: If the user's request matches your routing rules, you MUST transfer the call. To do this, simply say a brief transition sentence (e.g., "I'll transfer you now, please hold.") and append EXACTLY this tag at the very end of your response: [TRANSFER_TO_agent_id]\n\nAVAILABLE AGENTS & EXACT TAGS TO USE:\n`;
+                    finalPrompt += `\n\n=== MULTI-AGENT ROUTING RULES ===\n${groupRoutingConditions}\n\nIMPORTANT INSTRUCTION: If the user's request matches your routing rules, you MUST transfer the call. To do this, simply say a brief transition sentence (e.g., "I'll transfer you now, please hold.") and append EXACTLY this tag at the very end of your text response: [TRANSFER_TO_agent_id]\n\nAVAILABLE AGENTS & EXACT TAGS TO USE:\n`;
                     availableAgents.forEach(a => {
                         finalPrompt += `- To transfer to ${a.name}, use tag: [TRANSFER_TO_${a.id}]\n`;
                     });
@@ -582,21 +583,6 @@ fastify.register(async (fastify) => {
                     }
                 };
 
-                // Register Tool as secondary backup
-                if (isGroupCall) {
-                    setupMsg.setup.tools = [{
-                        function_declarations: [{
-                            name: "transfer_agent",
-                            description: "Transfer the active phone call to a different agent/department based on the routing rules.",
-                            parameters: {
-                                type: "OBJECT",
-                                properties: { agent_id: { type: "STRING", description: "The EXACT ID of the target agent." } },
-                                required: ["agent_id"]
-                            }
-                        }]
-                    }];
-                }
-
                 if (transferContext) {
                     isTransferContextActive = true;
                 }
@@ -611,7 +597,7 @@ fastify.register(async (fastify) => {
                     // Session Ready
                     if (msg.setupComplete !== undefined) {
                         geminiReady = true;
-                        isTransferring = false;
+                        isTransferring = false; // UNLOCKS TWILIO MIC STREAMING
                         
                         if (isTransferContextActive) {
                             const transferMsg = {
@@ -633,13 +619,8 @@ fastify.register(async (fastify) => {
                     if (msg.serverContent) {
                         const sc = msg.serverContent;
 
-                        // 1. Handle Interruption
-                        if (sc.interrupted) {
+                        if (sc.interrupted && !isTransferring) {
                             handleInterruption();
-                            // If user interrupted but a transfer tag was caught, trigger instantly & clear buffer
-                            if (pendingTransferTarget) {
-                                executeHotSwap(pendingTransferTarget, true);
-                            }
                             return;
                         }
 
@@ -654,27 +635,35 @@ fastify.register(async (fastify) => {
                         if (sc.modelTurn?.parts) {
                             for (const part of sc.modelTurn.parts) {
 
-                                // Check Function Tool
-                                if (part.functionCall && part.functionCall.name === 'transfer_agent') {
-                                    const requestedId = part.functionCall.args?.agent_id;
-                                    if (requestedId) pendingTransferTarget = requestedId;
-                                }
-
-                                // Check Text output
+                                // --- TEXT INTERCEPTION LOGIC ---
                                 if (part.text) {
                                     accumulatedText += part.text;
                                     
-                                    if (accumulatedText.includes('[END_CALL]')) {
+                                    // 1. Check for End Call
+                                    if (accumulatedText.includes('[END_CALL]') && !callEnded) {
+                                        console.log(`[SYS] Caught END_CALL Tag. Initiating disconnect in 1.5s...`);
                                         callEnded = true;
+                                        // Wait 1.5s for "Goodbye" audio to play on the phone
+                                        setTimeout(() => {
+                                            endCall('user_intent');
+                                        }, 1500); 
                                     }
 
+                                    // 2. Check for Transfer Tag
                                     const tagMatch = accumulatedText.match(/\[TRANSFER_TO_([a-zA-Z0-9-]+)\]/);
-                                    if (tagMatch) {
-                                        pendingTransferTarget = tagMatch[1];
+                                    if (tagMatch && !isTransferring) {
+                                        isTransferring = true;
+                                        const targetId = tagMatch[1];
+                                        console.log(`[SYS] Caught TRANSFER_TO tag for ID: ${targetId}. Triggering swap in 1.5s...`);
+                                        
+                                        // Wait 1.5s for "I'll transfer you now" audio to play naturally
+                                        setTimeout(() => {
+                                            executeHotSwap(targetId);
+                                        }, 1500);
                                     }
                                 }
 
-                                // Play Audio
+                                // Play AI Audio
                                 if (part.inlineData?.data) {
                                     const mimeType = part.inlineData.mimeType || '';
                                     if (mimeType.startsWith('audio/pcm') || mimeType === 'audio/pcm;rate=24000') {
@@ -703,26 +692,14 @@ fastify.register(async (fastify) => {
                             }
                         }
 
-                        // 2. Audio Generation Finished -> Safe to Swap!
+                        // Reset states safely when Gemini stops generating audio
                         if (sc.turnComplete) {
                             isSpeaking = false;
-
-                            // If a transfer target was captured during this turn, execute it seamlessly!
-                            if (pendingTransferTarget && !isTransferring) {
-                                executeHotSwap(pendingTransferTarget, false);
-                                return; // Kill turn logic for dead socket
-                            }
-
-                            if (callEnded) {
-                                setTimeout(async () => {
-                                    await saveCallToDatabase('user_intent');
-                                    if (connection.readyState === WebSocket.OPEN) connection.close();
-                                    if (geminiWs && geminiWs.readyState === WebSocket.OPEN) geminiWs.close();
-                                }, 500);
-                            }
                             
-                            // Important: Clear text state for next turn if we didn't swap
-                            accumulatedText = ''; 
+                            // Only reset text if we are NOT in the middle of a transfer operation
+                            if (!isTransferring) {
+                                accumulatedText = ''; 
+                            }
                         }
                     }
                 } catch (err) {
@@ -802,7 +779,7 @@ fastify.register(async (fastify) => {
 
                     case 'media':
                         latestMediaTimestamp = data.media.timestamp;
-                        // Pause piping mic input while transferring to prevent errors
+                        // MUTE TWILIO MIC INPUT WHILE SWAPPING AGENTS
                         if (geminiWs && geminiWs.readyState === WebSocket.OPEN && geminiReady && !isTransferring) {
                             const pcm16Payload = mulawBase64ToPcm16Base64(data.media.payload);
                             geminiWs.send(JSON.stringify({
