@@ -519,11 +519,11 @@ fastify.register(async (fastify) => {
                 let finalPrompt = currentAgent ? currentAgent.prompt : SYSTEM_MESSAGE;
                 let finalVoice = currentAgent ? currentAgent.voice : VOICE;
 
-                // Inject Routing Instructions and Tools if this is a Team Call
+                // Inject TEXT-BASED Routing Instructions for the Tagging System
                 if (isGroupCall && availableAgents.length > 0) {
-                    finalPrompt += `\n\n=== MULTI-AGENT ROUTING RULES ===\n${groupRoutingConditions}\n\nYou possess a tool called 'transfer_agent'. When the user's request matches these routing rules, you MUST use the tool to transfer the call immediately. Do not announce the transfer unless explicitly told to in the rules.\n\nAVAILABLE AGENTS:\n`;
+                    finalPrompt += `\n\n=== MULTI-AGENT ROUTING RULES ===\n${groupRoutingConditions}\n\nWhen the user's request matches these routing rules, you MUST transfer the call. To do this, simply say a natural transition phrase (like "Please hold on while I transfer you to my colleague") and append a special transfer tag at the VERY END of your text response. Do not announce the transfer tag aloud.\n\nAVAILABLE AGENTS & THEIR TAGS:\n`;
                     availableAgents.forEach(a => {
-                        finalPrompt += `- Name: ${a.name} | ID: ${a.id}\n`;
+                        finalPrompt += `- To transfer to ${a.name}, append tag: [TRANSFER_TO_${a.id}]\n`;
                     });
                 }
 
@@ -542,21 +542,6 @@ fastify.register(async (fastify) => {
                         system_instruction: { parts: [{ text: finalPrompt }] }
                     }
                 };
-
-                // Register Tool if it's a team call
-                if (isGroupCall) {
-                    setupMsg.setup.tools = [{
-                        function_declarations: [{
-                            name: "transfer_agent",
-                            description: "Transfer the active phone call to a different agent/department based on the routing rules.",
-                            parameters: {
-                                type: "OBJECT",
-                                properties: { agent_id: { type: "STRING", description: "The EXACT ID of the target agent from the available agents list." } },
-                                required: ["agent_id"]
-                            }
-                        }]
-                    }];
-                }
 
                 if (transferContext) {
                     isTransferContextActive = true;
@@ -611,53 +596,61 @@ fastify.register(async (fastify) => {
 
                         if (sc.modelTurn?.parts) {
                             for (const part of sc.modelTurn.parts) {
-                                
-                                // === HOT SWAP TRANSFER INTERCEPTOR ===
-                                if (part.functionCall && part.functionCall.name === 'transfer_agent') {
-                                    const targetId = String(part.functionCall.args.agent_id).trim();
-                                    const targetAgent = availableAgents.find(a => String(a.id).trim() === targetId);
-                                    
-                                    if (targetAgent && targetAgent.id !== currentAgent.id) {
-                                        console.log(`[HOT SWAP] Executing transfer from ${currentAgent.name} to ${targetAgent.name}`);
-                                        isTransferring = true;
-                                        
-                                        // 1. Instantly Halt Twilio audio
-                                        connection.send(JSON.stringify({ event: 'clear', streamSid }));
-                                        
-                                        // 2. HARD RESET state variables so the new agent doesn't get stuck
-                                        isSpeaking = false;
-                                        markQueue = []; 
-                                        accumulatedText = '';
-                                        
-                                        // 3. Setup New Identity
-                                        currentAgent = targetAgent;
-
-                                        // 4. Update Environment (Background Sound)
-                                        if (targetAgent.background_sound && targetAgent.background_sound !== 'none') {
-                                            soundVolume = targetAgent.sound_volume ?? 30;
-                                            loadSoundPCM(targetAgent.background_sound).then(s => {
-                                                soundSamples = s;
-                                                startSoundPump();
-                                            });
-                                        } else {
-                                            stopSoundPump();
-                                            soundSamples = null;
-                                        }
-
-                                        // 5. Restart Gemini with Context
-                                        const history = callerTranscriptParts.slice(-10).join('\n') || "No prior context available.";
-                                        
-                                        // Delay slightly to ensure old socket closure and clean Twilio buffers
-                                        setTimeout(() => { connectGemini(history); }, 200);
-                                        
-                                        return; // Kill execution of this loop for the old socket
-                                    }
-                                }
 
                                 if (part.text) {
                                     accumulatedText += part.text;
+                                    
                                     if (accumulatedText.includes('[END_CALL]')) {
                                         callEnded = true;
+                                    }
+
+                                    // === HOT SWAP TEXT TAG INTERCEPTOR ===
+                                    const transferMatch = accumulatedText.match(/\[TRANSFER_TO_([a-zA-Z0-9-]+)\]/);
+                                    
+                                    if (transferMatch && !isTransferring) {
+                                        const targetId = transferMatch[1];
+                                        const targetAgent = availableAgents.find(a => a.id === targetId);
+                                        
+                                        if (targetAgent && targetAgent.id !== currentAgent.id) {
+                                            console.log(`[HOT SWAP] Tag detected. Transferring from ${currentAgent.name} to ${targetAgent.name}...`);
+                                            isTransferring = true;
+                                            
+                                            // 1. Instantly kill the current Gemini WebSocket so it stops talking
+                                            geminiWs.close();
+                                            
+                                            // 2. Clear Twilio buffer
+                                            if (connection.readyState === WebSocket.OPEN) {
+                                                connection.send(JSON.stringify({ event: 'clear', streamSid }));
+                                            }
+                                            
+                                            // 3. HARD RESET state variables
+                                            isSpeaking = false;
+                                            markQueue = []; 
+                                            accumulatedText = '';
+                                            
+                                            // 4. Setup New Identity
+                                            currentAgent = targetAgent;
+
+                                            // 5. Update Environment (Background Sound)
+                                            if (targetAgent.background_sound && targetAgent.background_sound !== 'none') {
+                                                soundVolume = targetAgent.sound_volume ?? 30;
+                                                loadSoundPCM(targetAgent.background_sound).then(s => {
+                                                    soundSamples = s;
+                                                    startSoundPump();
+                                                });
+                                            } else {
+                                                stopSoundPump();
+                                                soundSamples = null;
+                                            }
+
+                                            // 6. Restart Gemini with Context
+                                            const history = callerTranscriptParts.slice(-10).join('\n') || "No prior context available.";
+                                            
+                                            // Short delay ensures ports are clean
+                                            setTimeout(() => { connectGemini(history); }, 250);
+                                            
+                                            return; 
+                                        }
                                     }
                                 }
 
