@@ -371,7 +371,9 @@ fastify.register(async (fastify) => {
         let geminiWs = null; 
         let geminiReady = false;
         let isTransferring = false;
+        let isDisconnecting = false; // New robust flag to manage disconnect states safely
         let isTransferContextActive = false;
+        let pendingTransferTarget = null; 
 
         let streamSid = null;
         let latestMediaTimestamp = 0;
@@ -381,7 +383,6 @@ fastify.register(async (fastify) => {
         let callEnded = false;
         let callTimer = null;
         
-        // Dedicated text accumulators
         let accumulatedText = '';
         let accumulatedTranscription = '';
         
@@ -405,26 +406,41 @@ fastify.register(async (fastify) => {
         let availableAgents = [];
         let currentAgent = null;
 
+        // --- MASTER CALL TERMINATION ENGINE ---
         const endCall = async (reason = 'timeout') => {
-            if (callEnded && reason !== 'timeout' && reason !== 'caller_hung_up') return;
-            if (callTimer) { clearTimeout(callTimer); callTimer = null; }
+            if (callEnded) return; // Failsafe to prevent double database updates
 
-            if (reason === 'timeout' && geminiWs && geminiWs.readyState === WebSocket.OPEN && geminiReady) {
-                callEnded = true;
-                const goodbyeMsg = {
-                    client_content: {
-                        turns: [{ role: 'user', parts: [{ text: '[INTERNAL INSTRUCTION - DO NOT READ ALOUD] End the call now naturally as an Indian caller who suddenly needs to leave. Keep it very short, casual, and human. Do not mention time limits. Append [END_CALL] at the end of your text response.' }] }],
-                        turn_complete: true
-                    }
-                };
-                geminiWs.send(JSON.stringify(goodbyeMsg));
-            } else {
-                callEnded = true;
-                stopSoundPump();
-                await saveCallToDatabase(reason);
-                if (connection.readyState === WebSocket.OPEN) connection.close();
-                if (geminiWs && geminiWs.readyState === WebSocket.OPEN) geminiWs.close();
+            // If it's just the timer hitting the max limit, we tell Gemini to say goodbye.
+            // We DO NOT close the socket yet, we wait for Gemini to say goodbye and trigger [END_CALL].
+            if (reason === 'timeout') {
+                if (geminiWs && geminiWs.readyState === WebSocket.OPEN && geminiReady) {
+                    console.log(`[SYS] Max Call Duration Reached. Injecting timeout instruction...`);
+                    const goodbyeMsg = {
+                        client_content: {
+                            turns: [{ role: 'user', parts: [{ text: '[INTERNAL INSTRUCTION - DO NOT READ ALOUD] The maximum call time limit has been reached. End the call now naturally as an Indian caller who suddenly needs to leave. Keep it very short, casual, and human. Do not mention time limits. Append [END_CALL] at the end of your text response.' }] }],
+                            turn_complete: true
+                        }
+                    };
+                    geminiWs.send(JSON.stringify(goodbyeMsg));
+                } else {
+                    // Failsafe if Gemini is broken when the timer fires
+                    endCall('forced_timeout'); 
+                }
+                return; 
             }
+
+            // Actual Physical Socket Termination
+            console.log(`[SYS] Physically closing call sockets. Reason: ${reason}`);
+            callEnded = true;
+            isDisconnecting = true;
+            
+            if (callTimer) { clearTimeout(callTimer); callTimer = null; }
+            
+            stopSoundPump();
+            await saveCallToDatabase(reason);
+            
+            if (connection.readyState === WebSocket.OPEN) connection.close();
+            if (geminiWs && geminiWs.readyState === WebSocket.OPEN) geminiWs.close();
         };
 
         const saveCallToDatabase = async (reason) => {
@@ -452,7 +468,7 @@ fastify.register(async (fastify) => {
             const CHUNK_SIZE_24K = 480;
 
             soundPumpInterval = setInterval(() => {
-                if (!streamSid || callEnded || isTransferring) return;
+                if (!streamSid || callEnded || isTransferring || isDisconnecting) return;
                 if (isSpeaking) return; 
 
                 try {
@@ -524,7 +540,6 @@ fastify.register(async (fastify) => {
                 geminiWs.close();
             }
 
-            // Hard reset text buffers to prevent stale tracking
             isSpeaking = false;
             markQueue = [];
             accumulatedText = '';
@@ -613,7 +628,7 @@ fastify.register(async (fastify) => {
                     if (msg.serverContent) {
                         const sc = msg.serverContent;
 
-                        if (sc.interrupted && !isTransferring) {
+                        if (sc.interrupted && !isTransferring && !isDisconnecting) {
                             handleInterruption();
                             return;
                         }
@@ -622,15 +637,15 @@ fastify.register(async (fastify) => {
                             callerTranscriptParts.push(`Caller: ${sc.inputTranscription.text}`);
                         }
 
-                        // Monitor the audio transcription stream directly as a strict fallback
+                        // Robust fallback transcription scanner
                         if (sc.outputTranscription?.text) {
                             const incomingText = sc.outputTranscription.text;
                             accumulatedTranscription += incomingText;
                             geminiTranscriptParts.push(`AI (${currentAgent?.name || 'System'}): ${incomingText}`);
 
-                            if (accumulatedTranscription.includes('[END_CALL]') && !callEnded) {
-                                console.log(`[SYS] Caught END_CALL Tag in transcription. Initiating disconnect in 1.5s...`);
-                                callEnded = true;
+                            if (accumulatedTranscription.includes('[END_CALL]') && !isDisconnecting) {
+                                console.log(`[SYS] Caught END_CALL Tag in transcription. Initiating socket disconnect in 1.5s...`);
+                                isDisconnecting = true;
                                 setTimeout(() => { endCall('user_intent'); }, 1500); 
                             }
 
@@ -643,15 +658,16 @@ fastify.register(async (fastify) => {
                             }
                         }
 
+                        // Primary Text Scanner
                         if (sc.modelTurn?.parts) {
                             for (const part of sc.modelTurn.parts) {
 
                                 if (part.text) {
                                     accumulatedText += part.text;
                                     
-                                    if (accumulatedText.includes('[END_CALL]') && !callEnded) {
-                                        console.log(`[SYS] Caught END_CALL Tag in text parts. Initiating disconnect in 1.5s...`);
-                                        callEnded = true;
+                                    if (accumulatedText.includes('[END_CALL]') && !isDisconnecting) {
+                                        console.log(`[SYS] Caught END_CALL Tag in text parts. Initiating socket disconnect in 1.5s...`);
+                                        isDisconnecting = true;
                                         setTimeout(() => { endCall('user_intent'); }, 1500); 
                                     }
 
@@ -694,8 +710,7 @@ fastify.register(async (fastify) => {
 
                         if (sc.turnComplete) {
                             isSpeaking = false;
-                            // Only reset buffers if a transfer is not actively executing
-                            if (!isTransferring) {
+                            if (!isTransferring && !isDisconnecting) {
                                 accumulatedText = ''; 
                                 accumulatedTranscription = '';
                             }
@@ -777,7 +792,7 @@ fastify.register(async (fastify) => {
 
                     case 'media':
                         latestMediaTimestamp = data.media.timestamp;
-                        if (geminiWs && geminiWs.readyState === WebSocket.OPEN && geminiReady && !isTransferring) {
+                        if (geminiWs && geminiWs.readyState === WebSocket.OPEN && geminiReady && !isTransferring && !isDisconnecting) {
                             const pcm16Payload = mulawBase64ToPcm16Base64(data.media.payload);
                             geminiWs.send(JSON.stringify({
                                 realtime_input: { media_chunks: [{ data: pcm16Payload, mime_type: 'audio/pcm;rate=16000' }] }
