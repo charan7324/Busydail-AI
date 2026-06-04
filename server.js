@@ -5,7 +5,6 @@ import fastifyFormBody from '@fastify/formbody';
 import fastifyWs from '@fastify/websocket';
 import { createClient } from '@supabase/supabase-js';
 import { spawn } from 'child_process';
-import nodemailer from 'nodemailer'; 
 
 dotenv.config();
 
@@ -259,99 +258,21 @@ async function getGroupById(groupId) {
     return data;
 }
 
-// --- SMART SETTINGS ENGINE (FIXED GLOBAL FALLBACK) ---
+// --- SMART SETTINGS ENGINE ---
 async function getActiveCallSettings(businessId, campaignId) {
     if (!businessId) return null;
     
-    // Read from campaign specific rules if provided
-    if (campaignId) {
-        console.log(`[SYS FETCH] Pulling live constraints from Campaign ID: ${campaignId}`);
-        const { data: camp, error } = await supabase
-            .from('campaigns')
-            .select('max_duration, timezone, email_collection_enabled, force_email_collection, fallback_email_template')
-            .eq('id', campaignId)
-            .single();
-            
-        if (!error && camp) {
-            return {
-                liveCallTasksPrompt: '', 
-                emailCollectionEnabled: camp.email_collection_enabled === true,
-                forceEmailCollection: camp.force_email_collection === true,
-                fallbackEmailTemplate: camp.fallback_email_template || ''
-            };
-        }
-    }
-
-    // Read from Global Workspace Settings
-    console.log(`[SYS FETCH] No campaign context. Falling back to global business settings.`);
+    // Read from global workspace settings
     const { data: biz, error } = await supabase
         .from('businesses')
-        .select('live_call_tasks_prompt, email_collection_enabled, force_email_collection, fallback_email_template')
+        .select('live_call_tasks_prompt')
         .eq('id', businessId)
         .single();
 
     if (error || !biz) return null;
     return {
-        liveCallTasksPrompt: biz.live_call_tasks_prompt || '',
-        emailCollectionEnabled: biz.email_collection_enabled === true, 
-        forceEmailCollection: biz.force_email_collection === true,
-        fallbackEmailTemplate: biz.fallback_email_template || ''
+        liveCallTasksPrompt: biz.live_call_tasks_prompt || ''
     };
-}
-
-// --- AUTOMATED SMTP BYO-EMAIL ENGINE ---
-async function executeEmailTrigger(targetEmail, businessId, customTemplate) {
-    try {
-        console.log(`[SMTP] Processing dispatch verification to: ${targetEmail}`);
-        const { data: biz, error } = await supabase
-            .from('businesses')
-            .select('connected_email, email_app_password, fallback_email_template')
-            .eq('id', businessId)
-            .single();
-
-        if (error || !biz || !biz.connected_email || !biz.email_app_password) {
-            console.log('[SMTP ABORT] Missing connected credentials for this profile. Skipping follow-up.');
-            return;
-        }
-
-        const userEmail = biz.connected_email.trim();
-        let smtpHost = 'smtp.gmail.com';
-        let smtpPort = 465;
-
-        // Domain auto-detection mapping layer
-        if (userEmail.endsWith('@outlook.com') || userEmail.endsWith('@hotmail.com')) {
-            smtpHost = 'smtp-mail.outlook.com';
-            smtpPort = 587;
-        } else if (userEmail.endsWith('@yahoo.com')) {
-            smtpHost = 'smtp.mail.yahoo.com';
-            smtpPort = 465;
-        }
-
-        const transporter = nodemailer.createTransport({
-            host: smtpHost,
-            port: smtpPort,
-            secure: smtpPort === 465, 
-            auth: {
-                user: userEmail,
-                pass: biz.email_app_password.trim()
-            }
-        });
-
-        // Use custom campaign template if provided, else fallback to business global
-        const finalTemplate = customTemplate || biz.fallback_email_template || 'Hello! Thank you for taking the time to speak with our team today.';
-
-        const mailOptions = {
-            from: userEmail,
-            to: targetEmail,
-            subject: 'Following up on our conversation',
-            text: finalTemplate
-        };
-
-        const info = await transporter.sendMail(mailOptions);
-        console.log(`[SMTP SUCCESS] Follow-up document routed securely from ${userEmail} -> ID: ${info.messageId}`);
-    } catch (err) {
-        console.error(`[SMTP BLOCK] Handshake validation failed: ${err.message}`);
-    }
 }
 
 async function generateCallSummary(callerTranscript, geminiTranscript) {
@@ -506,9 +427,6 @@ fastify.register(async (fastify) => {
 
         // Automated Task Rules Configuration
         let liveCallTasksPrompt = '';
-        let emailCollectionEnabled = false;
-        let forceEmailCollection = false;
-        let fallbackEmailTemplate = '';
         let capturedExtractedData = null;
 
         // --- MASTER CALL TERMINATION ENGINE ---
@@ -539,12 +457,6 @@ fastify.register(async (fastify) => {
             
             stopSoundPump();
             await saveCallToDatabase(reason);
-
-            // Execute Custom Smart Mail Trigger on Call Closure natively mapped
-            if (capturedExtractedData) {
-                console.log(`[AUTOMATION] Dispatching follow-up email directly to: ${capturedExtractedData}`);
-                executeEmailTrigger(capturedExtractedData, businessId, fallbackEmailTemplate);
-            }
             
             if (connection.readyState === WebSocket.OPEN) connection.close();
             if (geminiWs && geminiWs.readyState === WebSocket.OPEN) geminiWs.close();
@@ -694,24 +606,6 @@ fastify.register(async (fastify) => {
                 }
 
                 finalPrompt += `\n\nAdditionally follow these natural conversation rules:\n- Use natural fillers: "hmm...", "uh...", "okay..."\n- Keep responses VERY SHORT — 1-2 sentences max\n- If user is silent: "hello... are you there?"\n- If user wants to end call: say a warm goodbye and append [END_CALL] at the very end of your text response\n- The [END_CALL] tag is never spoken — it is only a signal`;
-
-                // --- NEW HIGH-PRIORITY EXEMPTION OVERRIDES ---
-                if (forceEmailCollection) {
-                    finalPrompt += `\n\n=== CRITICAL SYSTEM OVERRIDE: MANDATORY EMAIL COLLECTION ===
-Before ending this call, you absolutely MUST ask the user for their email address.
-1. You are EXEMPT from the short 1-2 sentence rule for this task.
-2. Ask naturally: "I'd love to send you some more details over email. Could you share your email address with me?"
-3. When they provide it, you MUST spell it back to them letter-by-letter to verify. (e.g., "Just to be sure, is that c-h-e-r-r-y at gmail dot com?")
-4. Once they confirm it is correct, append EXACTLY this tag to the end of your text response: [SEND_EMAIL: actual_email@domain.com] (replace with their confirmed email). Do NOT read the bracketed tag out loud.`;
-                } else if (emailCollectionEnabled) {
-                    finalPrompt += `\n\n=== CRITICAL SYSTEM OVERRIDE: INTEREST-BASED EMAIL COLLECTION ===
-Carefully monitor if the customer expresses ANY interest (e.g., "sounds good", "tell me more", "how does it work").
-If they show interest:
-1. You are EXEMPT from the short 1-2 sentence rule for this task.
-2. Ask naturally: "Awesome, I can send over more details to your email so you can check it out. Could you please share your email address?"
-3. When they provide it, you MUST spell it back to them letter-by-letter to verify. (e.g., "Just to be sure, is that c-h-e-r-r-y at gmail dot com?")
-4. Once they confirm it is correct, append EXACTLY this tag to the end of your text response: [SEND_EMAIL: actual_email@domain.com] (replace with their confirmed email). Do NOT read the bracketed tag out loud.`;
-                }
                 
                 if (liveCallTasksPrompt) {
                     finalPrompt += `\n\n=== SPECIAL USER-DEFINED LIVE ACTIONS ===\nYou must strictly fulfill these tasks during the call:\n${liveCallTasksPrompt}\n\nIf you successfully extract or satisfy the target information requested above (such as an email address, name, or appointment confirmation), you must cleanly append a structured data tag to your text response exactly like this example format: [EXTRACTED_DATA: email=user@domain.com, name=John]\nDo not read this bracket data block out loud to the caller.`;
@@ -779,10 +673,10 @@ If they show interest:
                             accumulatedTranscription += incomingText;
                             geminiTranscriptParts.push(`AI (${currentAgent?.name || 'System'}): ${incomingText}`);
 
-                            const dataMatch = accumulatedTranscription.match(/\[SEND_EMAIL:\s*([^\]]+)\]/i);
+                            const dataMatch = accumulatedTranscription.match(/\[EXTRACTED_DATA:\s*([^\]]+)\]/i);
                             if (dataMatch) {
                                 capturedExtractedData = dataMatch[1].trim();
-                                console.log(`[SYS] Email Target Captured (Transcription): ${capturedExtractedData}`);
+                                console.log(`[SYS] Target Captured (Transcription): ${capturedExtractedData}`);
                             }
 
                             if (accumulatedTranscription.includes('[END_CALL]') && !isDisconnecting) {
@@ -806,10 +700,10 @@ If they show interest:
                                 if (part.text) {
                                     accumulatedText += part.text;
 
-                                    const dataMatchText = accumulatedText.match(/\[SEND_EMAIL:\s*([^\]]+)\]/i);
+                                    const dataMatchText = accumulatedText.match(/\[EXTRACTED_DATA:\s*([^\]]+)\]/i);
                                     if (dataMatchText) {
                                         capturedExtractedData = dataMatchText[1].trim();
-                                        console.log(`[SYS] Email Target Captured (Text): ${capturedExtractedData}`);
+                                        console.log(`[SYS] Target Captured (Text): ${capturedExtractedData}`);
                                     }
                                     
                                     if (accumulatedText.includes('[END_CALL]') && !isDisconnecting) {
@@ -885,7 +779,6 @@ If they show interest:
                         const agentId = params.agentId || null;
                         const groupId = params.groupId || null;
                         
-                        // FIX: Safely extract campaignId handling string 'null'
                         let campaignId = params.campaignId;
                         if (!campaignId || campaignId === 'null' || campaignId === 'undefined') {
                             campaignId = null;
@@ -897,9 +790,6 @@ If they show interest:
                             const activeSettings = await getActiveCallSettings(businessId, campaignId);
                             if (activeSettings) {
                                 liveCallTasksPrompt = activeSettings.liveCallTasksPrompt;
-                                emailCollectionEnabled = activeSettings.emailCollectionEnabled;
-                                forceEmailCollection = activeSettings.forceEmailCollection;
-                                fallbackEmailTemplate = activeSettings.fallbackEmailTemplate;
                             }
                         }
 
