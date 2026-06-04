@@ -259,11 +259,11 @@ async function getGroupById(groupId) {
     return data;
 }
 
-// --- SMART SETTINGS ENGINE (CAMPAIGN OR BUSINESS LOOKUP) ---
+// --- SMART SETTINGS ENGINE (FIXED GLOBAL FALLBACK) ---
 async function getActiveCallSettings(businessId, campaignId) {
     if (!businessId) return null;
     
-    // If this call belongs to a campaign, read settings directly from the campaign row overrides
+    // Read from campaign specific rules if provided
     if (campaignId) {
         console.log(`[SYS FETCH] Pulling live constraints from Campaign ID: ${campaignId}`);
         const { data: camp, error } = await supabase
@@ -274,27 +274,27 @@ async function getActiveCallSettings(businessId, campaignId) {
             
         if (!error && camp) {
             return {
-                liveCallTasksPrompt: '', // Campaigns use structured toggles instead of custom prompt box
-                emailCollectionEnabled: camp.email_collection_enabled || false,
-                forceEmailCollection: camp.force_email_collection || false,
+                liveCallTasksPrompt: '', 
+                emailCollectionEnabled: camp.email_collection_enabled === true,
+                forceEmailCollection: camp.force_email_collection === true,
                 fallbackEmailTemplate: camp.fallback_email_template || ''
             };
         }
     }
 
-    // Fallback to global workspace settings if it's a direct single call
+    // Read from Global Workspace Settings
     console.log(`[SYS FETCH] No campaign context. Falling back to global business settings.`);
     const { data: biz, error } = await supabase
         .from('businesses')
-        .select('live_call_tasks_prompt, connected_email, email_app_password, fallback_email_template')
+        .select('live_call_tasks_prompt, email_collection_enabled, force_email_collection, fallback_email_template')
         .eq('id', businessId)
         .single();
 
     if (error || !biz) return null;
     return {
         liveCallTasksPrompt: biz.live_call_tasks_prompt || '',
-        emailCollectionEnabled: false, // Default global state ignores toggles
-        forceEmailCollection: false,
+        emailCollectionEnabled: biz.email_collection_enabled === true, 
+        forceEmailCollection: biz.force_email_collection === true,
         fallbackEmailTemplate: biz.fallback_email_template || ''
     };
 }
@@ -445,7 +445,6 @@ fastify.post('/make-call', async (request, reply) => {
                     'Authorization': `Basic ${credentials}`, 
                     'Content-Type': 'application/x-www-form-urlencoded' 
                 },
-                // FIXED: Using standard URLSearchParams class here
                 body: new URLSearchParams({ 
                     To: to, 
                     From: userTwilioNumber, 
@@ -566,7 +565,7 @@ fastify.register(async (fastify) => {
                 geminiTranscript, 
                 durationSeconds, 
                 summary,
-                creditsUsed: minutesUsed // Save usage directly to call DB
+                creditsUsed: minutesUsed 
             });
 
             await incrementBusinessCallCount(businessId);
@@ -636,7 +635,6 @@ fastify.register(async (fastify) => {
             }
         };
 
-        // --- MASTER HOT SWAP EXECUTION ENGINE ---
         const executeHotSwap = (targetId) => {
             const targetAgent = availableAgents.find(a => String(a.id).trim() === targetId.trim());
             
@@ -697,11 +695,22 @@ fastify.register(async (fastify) => {
 
                 finalPrompt += `\n\nAdditionally follow these natural conversation rules:\n- Use natural fillers: "hmm...", "uh...", "okay..."\n- Keep responses VERY SHORT — 1-2 sentences max\n- If user is silent: "hello... are you there?"\n- If user wants to end call: say a warm goodbye and append [END_CALL] at the very end of your text response\n- The [END_CALL] tag is never spoken — it is only a signal`;
 
-                // Inject dynamic automated rules explicitly based on UI Toggles
+                // --- NEW HIGH-PRIORITY EXEMPTION OVERRIDES ---
                 if (forceEmailCollection) {
-                    finalPrompt += `\n\n=== MANDATORY EMAIL FOLLOW-UP (HIGHEST PRIORITY) ===\nBefore ending the call, you MUST ask the user for their email address to send them details. You are permitted to exceed the normal short response limit to politely request this. When they provide it, confirm the spelling letter-by-letter. Once confirmed correct, you MUST append this exact tag at the end of your response: [SEND_EMAIL: user_provided_email@domain.com] (replace with their actual confirmed email). Do not read the bracket tag out loud.`;
+                    finalPrompt += `\n\n=== CRITICAL SYSTEM OVERRIDE: MANDATORY EMAIL COLLECTION ===
+Before ending this call, you absolutely MUST ask the user for their email address.
+1. You are EXEMPT from the short 1-2 sentence rule for this task.
+2. Ask naturally: "I'd love to send you some more details over email. Could you share your email address with me?"
+3. When they provide it, you MUST spell it back to them letter-by-letter to verify. (e.g., "Just to be sure, is that c-h-e-r-r-y at gmail dot com?")
+4. Once they confirm it is correct, append EXACTLY this tag to the end of your text response: [SEND_EMAIL: actual_email@domain.com] (replace with their confirmed email). Do NOT read the bracketed tag out loud.`;
                 } else if (emailCollectionEnabled) {
-                    finalPrompt += `\n\n=== INTEREST-BASED EMAIL FOLLOW-UP (HIGHEST PRIORITY) ===\nMonitor the conversation. If the user expresses ANY interest, you are permitted to exceed the short response limit to naturally ask for their email address so you can send them details. When they provide it, confirm the spelling letter-by-letter. Once confirmed correct, you MUST append this exact tag at the end of your response: [SEND_EMAIL: user_provided_email@domain.com] (replace with their actual confirmed email). Do not read the bracket tag out loud.`;
+                    finalPrompt += `\n\n=== CRITICAL SYSTEM OVERRIDE: INTEREST-BASED EMAIL COLLECTION ===
+Carefully monitor if the customer expresses ANY interest (e.g., "sounds good", "tell me more", "how does it work").
+If they show interest:
+1. You are EXEMPT from the short 1-2 sentence rule for this task.
+2. Ask naturally: "Awesome, I can send over more details to your email so you can check it out. Could you please share your email address?"
+3. When they provide it, you MUST spell it back to them letter-by-letter to verify. (e.g., "Just to be sure, is that c-h-e-r-r-y at gmail dot com?")
+4. Once they confirm it is correct, append EXACTLY this tag to the end of your text response: [SEND_EMAIL: actual_email@domain.com] (replace with their confirmed email). Do NOT read the bracketed tag out loud.`;
                 }
                 
                 if (liveCallTasksPrompt) {
@@ -770,7 +779,6 @@ fastify.register(async (fastify) => {
                             accumulatedTranscription += incomingText;
                             geminiTranscriptParts.push(`AI (${currentAgent?.name || 'System'}): ${incomingText}`);
 
-                            // Scanner for the exact SEND_EMAIL extraction block
                             const dataMatch = accumulatedTranscription.match(/\[SEND_EMAIL:\s*([^\]]+)\]/i);
                             if (dataMatch) {
                                 capturedExtractedData = dataMatch[1].trim();
@@ -798,7 +806,6 @@ fastify.register(async (fastify) => {
                                 if (part.text) {
                                     accumulatedText += part.text;
 
-                                    // Primary text parser for SEND_EMAIL block
                                     const dataMatchText = accumulatedText.match(/\[SEND_EMAIL:\s*([^\]]+)\]/i);
                                     if (dataMatchText) {
                                         capturedExtractedData = dataMatchText[1].trim();
@@ -877,7 +884,13 @@ fastify.register(async (fastify) => {
                         direction = params.direction || 'inbound';
                         const agentId = params.agentId || null;
                         const groupId = params.groupId || null;
-                        const campaignId = params.campaignId || null;
+                        
+                        // FIX: Safely extract campaignId handling string 'null'
+                        let campaignId = params.campaignId;
+                        if (!campaignId || campaignId === 'null' || campaignId === 'undefined') {
+                            campaignId = null;
+                        }
+                        
                         const maxDurationSec = parseInt(params.maxDuration || '120', 10);
 
                         if (businessId) {
