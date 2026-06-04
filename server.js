@@ -218,7 +218,6 @@ async function createCallRecord({ businessId, contactId, direction, twilioCallSi
     return data.id;
 }
 
-// Updated to track credits_used natively
 async function updateCallRecord(callId, { status, callerTranscript, geminiTranscript, durationSeconds, summary, creditsUsed }) {
     if (!callId) return;
     const { error } = await supabase
@@ -260,20 +259,48 @@ async function getGroupById(groupId) {
     return data;
 }
 
-// Updated to fetch the new Email Automation Configuration Toggles
-async function getBusinessSettings(businessId) {
+// --- SMART SETTINGS ENGINE (CAMPAIGN OR BUSINESS LOOKUP) ---
+async function getActiveCallSettings(businessId, campaignId) {
     if (!businessId) return null;
-    const { data, error } = await supabase
+    
+    // If this call belongs to a campaign, read settings directly from the campaign row overrides
+    if (campaignId) {
+        console.log(`[SYS FETCH] Pulling live constraints from Campaign ID: ${campaignId}`);
+        const { data: camp, error } = await supabase
+            .from('campaigns')
+            .select('max_duration, timezone, email_collection_enabled, force_email_collection, fallback_email_template')
+            .eq('id', campaignId)
+            .single();
+            
+        if (!error && camp) {
+            return {
+                liveCallTasksPrompt: '', // Campaigns use structured toggles instead of custom prompt box
+                emailCollectionEnabled: camp.email_collection_enabled || false,
+                forceEmailCollection: camp.force_email_collection || false,
+                fallbackEmailTemplate: camp.fallback_email_template || ''
+            };
+        }
+    }
+
+    // Fallback to global workspace settings if it's a direct single call
+    console.log(`[SYS FETCH] No campaign context. Falling back to global business settings.`);
+    const { data: biz, error } = await supabase
         .from('businesses')
-        .select('email_collection_enabled, force_email_collection, connected_email, email_app_password, fallback_email_template')
+        .select('live_call_tasks_prompt, connected_email, email_app_password, fallback_email_template')
         .eq('id', businessId)
         .single();
-    if (error) return null;
-    return data;
+
+    if (error || !biz) return null;
+    return {
+        liveCallTasksPrompt: biz.live_call_tasks_prompt || '',
+        emailCollectionEnabled: false, // Default global state ignores toggles
+        forceEmailCollection: false,
+        fallbackEmailTemplate: biz.fallback_email_template || ''
+    };
 }
 
 // --- AUTOMATED SMTP BYO-EMAIL ENGINE ---
-async function executeEmailTrigger(targetEmail, businessId) {
+async function executeEmailTrigger(targetEmail, businessId, customTemplate) {
     try {
         console.log(`[SMTP] Processing dispatch verification to: ${targetEmail}`);
         const { data: biz, error } = await supabase
@@ -310,11 +337,14 @@ async function executeEmailTrigger(targetEmail, businessId) {
             }
         });
 
+        // Use custom campaign template if provided, else fallback to business global
+        const finalTemplate = customTemplate || biz.fallback_email_template || 'Hello! Thank you for taking the time to speak with our team today.';
+
         const mailOptions = {
             from: userEmail,
             to: targetEmail,
             subject: 'Following up on our conversation',
-            text: biz.fallback_email_template || 'Hello! Thank you for taking the time to speak with our team today.'
+            text: finalTemplate
         };
 
         const info = await transporter.sendMail(mailOptions);
@@ -361,6 +391,7 @@ fastify.all('/incoming-call', async (request, reply) => {
             <Parameter name="direction" value="${request.query.direction || 'inbound'}" />
             <Parameter name="agentId" value="${request.query.agentId || ''}" />
             <Parameter name="groupId" value="${request.query.groupId || ''}" />
+            <Parameter name="campaignId" value="${request.query.campaignId || ''}" />
             <Parameter name="maxDuration" value="${request.query.maxDuration || '120'}" />
         </Stream>
     </Connect>
@@ -369,7 +400,7 @@ fastify.all('/incoming-call', async (request, reply) => {
 });
 
 fastify.post('/make-call', async (request, reply) => {
-    const { to, businessId, contactId, agentId, groupId, maxDuration } = request.body;
+    const { to, businessId, contactId, agentId, groupId, campaignId, maxDuration } = request.body;
     if (!to) return reply.status(400).send({ error: 'Missing "to" phone number' });
     if (!businessId) return reply.status(400).send({ error: 'Missing business ID' });
 
@@ -402,6 +433,7 @@ fastify.post('/make-call', async (request, reply) => {
         if (contactId) webhookUrl.searchParams.set('contactId', contactId);
         if (agentId) webhookUrl.searchParams.set('agentId', agentId);
         if (groupId) webhookUrl.searchParams.set('groupId', groupId);
+        if (campaignId) webhookUrl.searchParams.set('campaignId', campaignId);
         webhookUrl.searchParams.set('maxDuration', maxDuration || '120');
         webhookUrl.searchParams.set('direction', 'outbound');
 
@@ -413,6 +445,7 @@ fastify.post('/make-call', async (request, reply) => {
                     'Authorization': `Basic ${credentials}`, 
                     'Content-Type': 'application/x-www-form-urlencoded' 
                 },
+                // FIXED: Using standard URLSearchParams class here
                 body: new URLSearchParams({ 
                     To: to, 
                     From: userTwilioNumber, 
@@ -473,8 +506,10 @@ fastify.register(async (fastify) => {
         let currentAgent = null;
 
         // Automated Task Rules Configuration
+        let liveCallTasksPrompt = '';
         let emailCollectionEnabled = false;
         let forceEmailCollection = false;
+        let fallbackEmailTemplate = '';
         let capturedExtractedData = null;
 
         // --- MASTER CALL TERMINATION ENGINE ---
@@ -509,7 +544,7 @@ fastify.register(async (fastify) => {
             // Execute Custom Smart Mail Trigger on Call Closure natively mapped
             if (capturedExtractedData) {
                 console.log(`[AUTOMATION] Dispatching follow-up email directly to: ${capturedExtractedData}`);
-                executeEmailTrigger(capturedExtractedData, businessId);
+                executeEmailTrigger(capturedExtractedData, businessId, fallbackEmailTemplate);
             }
             
             if (connection.readyState === WebSocket.OPEN) connection.close();
@@ -667,6 +702,10 @@ fastify.register(async (fastify) => {
                     finalPrompt += `\n\n=== MANDATORY EMAIL FOLLOW-UP (HIGHEST PRIORITY) ===\nBefore ending the call, you MUST ask the user for their email address to send them details. You are permitted to exceed the normal short response limit to politely request this. When they provide it, confirm the spelling letter-by-letter. Once confirmed correct, you MUST append this exact tag at the end of your response: [SEND_EMAIL: user_provided_email@domain.com] (replace with their actual confirmed email). Do not read the bracket tag out loud.`;
                 } else if (emailCollectionEnabled) {
                     finalPrompt += `\n\n=== INTEREST-BASED EMAIL FOLLOW-UP (HIGHEST PRIORITY) ===\nMonitor the conversation. If the user expresses ANY interest, you are permitted to exceed the short response limit to naturally ask for their email address so you can send them details. When they provide it, confirm the spelling letter-by-letter. Once confirmed correct, you MUST append this exact tag at the end of your response: [SEND_EMAIL: user_provided_email@domain.com] (replace with their actual confirmed email). Do not read the bracket tag out loud.`;
+                }
+                
+                if (liveCallTasksPrompt) {
+                    finalPrompt += `\n\n=== SPECIAL USER-DEFINED LIVE ACTIONS ===\nYou must strictly fulfill these tasks during the call:\n${liveCallTasksPrompt}\n\nIf you successfully extract or satisfy the target information requested above (such as an email address, name, or appointment confirmation), you must cleanly append a structured data tag to your text response exactly like this example format: [EXTRACTED_DATA: email=user@domain.com, name=John]\nDo not read this bracket data block out loud to the caller.`;
                 }
 
                 const setupMsg = {
@@ -838,13 +877,16 @@ fastify.register(async (fastify) => {
                         direction = params.direction || 'inbound';
                         const agentId = params.agentId || null;
                         const groupId = params.groupId || null;
+                        const campaignId = params.campaignId || null;
                         const maxDurationSec = parseInt(params.maxDuration || '120', 10);
 
                         if (businessId) {
-                            const bizSettings = await getBusinessSettings(businessId);
-                            if (bizSettings) {
-                                emailCollectionEnabled = bizSettings.email_collection_enabled || false;
-                                forceEmailCollection = bizSettings.force_email_collection || false;
+                            const activeSettings = await getActiveCallSettings(businessId, campaignId);
+                            if (activeSettings) {
+                                liveCallTasksPrompt = activeSettings.liveCallTasksPrompt;
+                                emailCollectionEnabled = activeSettings.emailCollectionEnabled;
+                                forceEmailCollection = activeSettings.forceEmailCollection;
+                                fallbackEmailTemplate = activeSettings.fallbackEmailTemplate;
                             }
                         }
 
