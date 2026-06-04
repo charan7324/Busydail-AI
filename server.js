@@ -5,6 +5,7 @@ import fastifyFormBody from '@fastify/formbody';
 import fastifyWs from '@fastify/websocket';
 import { createClient } from '@supabase/supabase-js';
 import { spawn } from 'child_process';
+import nodemailer from 'nodemailer'; // Loaded package securely
 
 dotenv.config();
 
@@ -257,6 +258,69 @@ async function getGroupById(groupId) {
     return data;
 }
 
+async function getBusinessSettings(businessId) {
+    if (!businessId) return null;
+    const { data, error } = await supabase
+        .from('businesses')
+        .select('live_call_tasks_prompt, connected_email, email_app_password, fallback_email_template')
+        .eq('id', businessId)
+        .single();
+    if (error) return null;
+    return data;
+}
+
+// --- AUTOMATED SMTP BYO-EMAIL ENGINE ---
+async function executeEmailTrigger(targetEmail, businessId) {
+    try {
+        console.log(`[SMTP] Processing dispatch verification to: ${targetEmail}`);
+        const { data: biz, error } = await supabase
+            .from('businesses')
+            .select('connected_email, email_app_password, fallback_email_template')
+            .eq('id', businessId)
+            .single();
+
+        if (error || !biz || !biz.connected_email || !biz.email_app_password) {
+            console.log('[SMTP ABORT] Missing connected credentials for this profile. Skipping follow-up.');
+            return;
+        }
+
+        const userEmail = biz.connected_email.trim();
+        let smtpHost = 'smtp.gmail.com';
+        let smtpPort = 465;
+
+        // Domain auto-detection mapping layer
+        if (userEmail.endsWith('@outlook.com') || userEmail.endsWith('@hotmail.com')) {
+            smtpHost = 'smtp-mail.outlook.com';
+            smtpPort = 587;
+        } else if (userEmail.endsWith('@yahoo.com')) {
+            smtpHost = 'smtp.mail.yahoo.com';
+            smtpPort = 465;
+        }
+
+        const transporter = nodemailer.createTransport({
+            host: smtpHost,
+            port: smtpPort,
+            secure: smtpPort === 465, 
+            auth: {
+                user: userEmail,
+                pass: biz.email_app_password.trim()
+            }
+        });
+
+        const mailOptions = {
+            from: userEmail,
+            to: targetEmail,
+            subject: 'Following up on our conversation',
+            text: biz.fallback_email_template || 'Hello! Thank you for taking the time to speak with our team today.'
+        };
+
+        const info = await transporter.sendMail(mailOptions);
+        console.log(`[SMTP SUCCESS] Follow-up document routed securely from ${userEmail} -> ID: ${info.messageId}`);
+    } catch (err) {
+        console.error(`[SMTP BLOCK] Handshake validation failed: ${err.message}`);
+    }
+}
+
 async function generateCallSummary(callerTranscript, geminiTranscript) {
     if (!callerTranscript && !geminiTranscript) return null;
     try {
@@ -371,7 +435,7 @@ fastify.register(async (fastify) => {
         let geminiWs = null; 
         let geminiReady = false;
         let isTransferring = false;
-        let isDisconnecting = false; // New robust flag to manage disconnect states safely
+        let isDisconnecting = false; 
         let isTransferContextActive = false;
         let pendingTransferTarget = null; 
 
@@ -406,12 +470,15 @@ fastify.register(async (fastify) => {
         let availableAgents = [];
         let currentAgent = null;
 
+        // Task Automation State
+        let liveCallTasksPrompt = '';
+        let fallbackEmailTemplate = '';
+        let capturedExtractedData = null;
+
         // --- MASTER CALL TERMINATION ENGINE ---
         const endCall = async (reason = 'timeout') => {
-            if (callEnded) return; // Failsafe to prevent double database updates
+            if (callEnded) return;
 
-            // If it's just the timer hitting the max limit, we tell Gemini to say goodbye.
-            // We DO NOT close the socket yet, we wait for Gemini to say goodbye and trigger [END_CALL].
             if (reason === 'timeout') {
                 if (geminiWs && geminiWs.readyState === WebSocket.OPEN && geminiReady) {
                     console.log(`[SYS] Max Call Duration Reached. Injecting timeout instruction...`);
@@ -423,13 +490,11 @@ fastify.register(async (fastify) => {
                     };
                     geminiWs.send(JSON.stringify(goodbyeMsg));
                 } else {
-                    // Failsafe if Gemini is broken when the timer fires
                     endCall('forced_timeout'); 
                 }
                 return; 
             }
 
-            // Actual Physical Socket Termination
             console.log(`[SYS] Physically closing call sockets. Reason: ${reason}`);
             callEnded = true;
             isDisconnecting = true;
@@ -438,6 +503,17 @@ fastify.register(async (fastify) => {
             
             stopSoundPump();
             await saveCallToDatabase(reason);
+
+            // Execute Custom Smart Mail Trigger on Call Closure
+            if (capturedExtractedData) {
+                console.log(`[TASK EXECUTION] Parsing rules for call closure action...`);
+                const emailMatch = capturedExtractedData.match(/email=([^\s,\]]+)/);
+                if (emailMatch) {
+                    const extractedEmail = emailMatch[1];
+                    console.log(`[AUTOMATION] Dispatching follow-up email directly to: ${extractedEmail}`);
+                    executeEmailTrigger(extractedEmail, businessId);
+                }
+            }
             
             if (connection.readyState === WebSocket.OPEN) connection.close();
             if (geminiWs && geminiWs.readyState === WebSocket.OPEN) geminiWs.close();
@@ -580,6 +656,15 @@ fastify.register(async (fastify) => {
 
                 finalPrompt += `\n\nAdditionally follow these natural conversation rules:\n- Use natural fillers: "hmm...", "uh...", "okay..."\n- Keep responses VERY SHORT — 1-2 sentences max\n- If user is silent: "hello... are you there?"\n- If user wants to end call: say a warm goodbye and append [END_CALL] at the very end of your text response\n- The [END_CALL] tag is never spoken — it is only a signal`;
 
+                if (liveCallTasksPrompt) {
+                    finalPrompt += `\n\n=== SPECIAL USER-DEFINED LIVE ACTIONS ===
+You must strictly fulfill these tasks during the call:
+${liveCallTasksPrompt}
+
+If you successfully extract or satisfy the target information requested above (such as an email address, name, or appointment confirmation), you must cleanly append a structured data tag to your text response exactly like this example format: [EXTRACTED_DATA: email=user@domain.com, name=John]
+Do not read this bracket data block out loud to the caller.`;
+                }
+
                 const setupMsg = {
                     setup: {
                         model: `models/${MODEL}`,
@@ -637,11 +722,16 @@ fastify.register(async (fastify) => {
                             callerTranscriptParts.push(`Caller: ${sc.inputTranscription.text}`);
                         }
 
-                        // Robust fallback transcription scanner
                         if (sc.outputTranscription?.text) {
                             const incomingText = sc.outputTranscription.text;
                             accumulatedTranscription += incomingText;
                             geminiTranscriptParts.push(`AI (${currentAgent?.name || 'System'}): ${incomingText}`);
+
+                            const dataMatch = accumulatedTranscription.match(/\[EXTRACTED_DATA:\s*([^\]]+)\]/);
+                            if (dataMatch) {
+                                capturedExtractedData = dataMatch[1];
+                                console.log(`[SYS] Call Action Target Captured (Transcription): ${capturedExtractedData}`);
+                            }
 
                             if (accumulatedTranscription.includes('[END_CALL]') && !isDisconnecting) {
                                 console.log(`[SYS] Caught END_CALL Tag in transcription. Initiating socket disconnect in 1.5s...`);
@@ -658,12 +748,17 @@ fastify.register(async (fastify) => {
                             }
                         }
 
-                        // Primary Text Scanner
                         if (sc.modelTurn?.parts) {
                             for (const part of sc.modelTurn.parts) {
 
                                 if (part.text) {
                                     accumulatedText += part.text;
+
+                                    const dataMatchText = accumulatedText.match(/\[EXTRACTED_DATA:\s*([^\]]+)\]/);
+                                    if (dataMatchText) {
+                                        capturedExtractedData = dataMatchText[1];
+                                        console.log(`[SYS] Call Action Target Captured (Text): ${capturedExtractedData}`);
+                                    }
                                     
                                     if (accumulatedText.includes('[END_CALL]') && !isDisconnecting) {
                                         console.log(`[SYS] Caught END_CALL Tag in text parts. Initiating socket disconnect in 1.5s...`);
@@ -738,6 +833,14 @@ fastify.register(async (fastify) => {
                         const agentId = params.agentId || null;
                         const groupId = params.groupId || null;
                         const maxDurationSec = parseInt(params.maxDuration || '120', 10);
+
+                        if (businessId) {
+                            const bizSettings = await getBusinessSettings(businessId);
+                            if (bizSettings) {
+                                liveCallTasksPrompt = bizSettings.live_call_tasks_prompt || '';
+                                fallbackEmailTemplate = bizSettings.fallback_email_template || '';
+                            }
+                        }
 
                         if (groupId) {
                             isGroupCall = true;
