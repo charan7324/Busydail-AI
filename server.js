@@ -5,7 +5,7 @@ import fastifyFormBody from '@fastify/formbody';
 import fastifyWs from '@fastify/websocket';
 import { createClient } from '@supabase/supabase-js';
 import { spawn } from 'child_process';
-import nodemailer from 'nodemailer'; // Loaded package securely
+import nodemailer from 'nodemailer'; 
 
 dotenv.config();
 
@@ -218,7 +218,8 @@ async function createCallRecord({ businessId, contactId, direction, twilioCallSi
     return data.id;
 }
 
-async function updateCallRecord(callId, { status, callerTranscript, geminiTranscript, durationSeconds, summary }) {
+// Updated to track credits_used natively
+async function updateCallRecord(callId, { status, callerTranscript, geminiTranscript, durationSeconds, summary, creditsUsed }) {
     if (!callId) return;
     const { error } = await supabase
         .from('calls')
@@ -227,6 +228,7 @@ async function updateCallRecord(callId, { status, callerTranscript, geminiTransc
             caller_transcript: callerTranscript || null,
             gemini_transcript: geminiTranscript || null,
             duration_seconds: durationSeconds || 0,
+            credits_used: creditsUsed || 0,
             summary: summary || null,
             ended_at: new Date().toISOString()
         })
@@ -258,11 +260,12 @@ async function getGroupById(groupId) {
     return data;
 }
 
+// Updated to fetch the new Email Automation Configuration Toggles
 async function getBusinessSettings(businessId) {
     if (!businessId) return null;
     const { data, error } = await supabase
         .from('businesses')
-        .select('live_call_tasks_prompt, connected_email, email_app_password, fallback_email_template')
+        .select('email_collection_enabled, force_email_collection, connected_email, email_app_password, fallback_email_template')
         .eq('id', businessId)
         .single();
     if (error) return null;
@@ -437,7 +440,6 @@ fastify.register(async (fastify) => {
         let isTransferring = false;
         let isDisconnecting = false; 
         let isTransferContextActive = false;
-        let pendingTransferTarget = null; 
 
         let streamSid = null;
         let latestMediaTimestamp = 0;
@@ -470,9 +472,9 @@ fastify.register(async (fastify) => {
         let availableAgents = [];
         let currentAgent = null;
 
-        // Task Automation State
-        let liveCallTasksPrompt = '';
-        let fallbackEmailTemplate = '';
+        // Automated Task Rules Configuration
+        let emailCollectionEnabled = false;
+        let forceEmailCollection = false;
         let capturedExtractedData = null;
 
         // --- MASTER CALL TERMINATION ENGINE ---
@@ -504,15 +506,10 @@ fastify.register(async (fastify) => {
             stopSoundPump();
             await saveCallToDatabase(reason);
 
-            // Execute Custom Smart Mail Trigger on Call Closure
+            // Execute Custom Smart Mail Trigger on Call Closure natively mapped
             if (capturedExtractedData) {
-                console.log(`[TASK EXECUTION] Parsing rules for call closure action...`);
-                const emailMatch = capturedExtractedData.match(/email=([^\s,\]]+)/);
-                if (emailMatch) {
-                    const extractedEmail = emailMatch[1];
-                    console.log(`[AUTOMATION] Dispatching follow-up email directly to: ${extractedEmail}`);
-                    executeEmailTrigger(extractedEmail, businessId);
-                }
+                console.log(`[AUTOMATION] Dispatching follow-up email directly to: ${capturedExtractedData}`);
+                executeEmailTrigger(capturedExtractedData, businessId);
             }
             
             if (connection.readyState === WebSocket.OPEN) connection.close();
@@ -526,10 +523,19 @@ fastify.register(async (fastify) => {
             const geminiTranscript = geminiTranscriptParts.join('\n') || null;
 
             const summary = await generateCallSummary(callerTranscript, geminiTranscript);
-            await updateCallRecord(callId, { status: 'completed', callerTranscript, geminiTranscript, durationSeconds, summary });
+            const minutesUsed = Math.ceil(durationSeconds / 60);
+
+            await updateCallRecord(callId, { 
+                status: 'completed', 
+                callerTranscript, 
+                geminiTranscript, 
+                durationSeconds, 
+                summary,
+                creditsUsed: minutesUsed // Save usage directly to call DB
+            });
+
             await incrementBusinessCallCount(businessId);
 
-            const minutesUsed = Math.ceil(durationSeconds / 60);
             if (minutesUsed > 0) {
                 await supabase.rpc('subtract_credits', { 
                     business_id_input: businessId, 
@@ -656,13 +662,11 @@ fastify.register(async (fastify) => {
 
                 finalPrompt += `\n\nAdditionally follow these natural conversation rules:\n- Use natural fillers: "hmm...", "uh...", "okay..."\n- Keep responses VERY SHORT — 1-2 sentences max\n- If user is silent: "hello... are you there?"\n- If user wants to end call: say a warm goodbye and append [END_CALL] at the very end of your text response\n- The [END_CALL] tag is never spoken — it is only a signal`;
 
-                if (liveCallTasksPrompt) {
-                    finalPrompt += `\n\n=== SPECIAL USER-DEFINED LIVE ACTIONS ===
-You must strictly fulfill these tasks during the call:
-${liveCallTasksPrompt}
-
-If you successfully extract or satisfy the target information requested above (such as an email address, name, or appointment confirmation), you must cleanly append a structured data tag to your text response exactly like this example format: [EXTRACTED_DATA: email=user@domain.com, name=John]
-Do not read this bracket data block out loud to the caller.`;
+                // Inject dynamic automated rules explicitly based on UI Toggles
+                if (forceEmailCollection) {
+                    finalPrompt += `\n\n=== MANDATORY EMAIL FOLLOW-UP (HIGHEST PRIORITY) ===\nBefore ending the call, you MUST ask the user for their email address to send them details. You are permitted to exceed the normal short response limit to politely request this. When they provide it, confirm the spelling letter-by-letter. Once confirmed correct, you MUST append this exact tag at the end of your response: [SEND_EMAIL: user_provided_email@domain.com] (replace with their actual confirmed email). Do not read the bracket tag out loud.`;
+                } else if (emailCollectionEnabled) {
+                    finalPrompt += `\n\n=== INTEREST-BASED EMAIL FOLLOW-UP (HIGHEST PRIORITY) ===\nMonitor the conversation. If the user expresses ANY interest, you are permitted to exceed the short response limit to naturally ask for their email address so you can send them details. When they provide it, confirm the spelling letter-by-letter. Once confirmed correct, you MUST append this exact tag at the end of your response: [SEND_EMAIL: user_provided_email@domain.com] (replace with their actual confirmed email). Do not read the bracket tag out loud.`;
                 }
 
                 const setupMsg = {
@@ -727,10 +731,11 @@ Do not read this bracket data block out loud to the caller.`;
                             accumulatedTranscription += incomingText;
                             geminiTranscriptParts.push(`AI (${currentAgent?.name || 'System'}): ${incomingText}`);
 
-                            const dataMatch = accumulatedTranscription.match(/\[EXTRACTED_DATA:\s*([^\]]+)\]/);
+                            // Scanner for the exact SEND_EMAIL extraction block
+                            const dataMatch = accumulatedTranscription.match(/\[SEND_EMAIL:\s*([^\]]+)\]/i);
                             if (dataMatch) {
-                                capturedExtractedData = dataMatch[1];
-                                console.log(`[SYS] Call Action Target Captured (Transcription): ${capturedExtractedData}`);
+                                capturedExtractedData = dataMatch[1].trim();
+                                console.log(`[SYS] Email Target Captured (Transcription): ${capturedExtractedData}`);
                             }
 
                             if (accumulatedTranscription.includes('[END_CALL]') && !isDisconnecting) {
@@ -754,10 +759,11 @@ Do not read this bracket data block out loud to the caller.`;
                                 if (part.text) {
                                     accumulatedText += part.text;
 
-                                    const dataMatchText = accumulatedText.match(/\[EXTRACTED_DATA:\s*([^\]]+)\]/);
+                                    // Primary text parser for SEND_EMAIL block
+                                    const dataMatchText = accumulatedText.match(/\[SEND_EMAIL:\s*([^\]]+)\]/i);
                                     if (dataMatchText) {
-                                        capturedExtractedData = dataMatchText[1];
-                                        console.log(`[SYS] Call Action Target Captured (Text): ${capturedExtractedData}`);
+                                        capturedExtractedData = dataMatchText[1].trim();
+                                        console.log(`[SYS] Email Target Captured (Text): ${capturedExtractedData}`);
                                     }
                                     
                                     if (accumulatedText.includes('[END_CALL]') && !isDisconnecting) {
@@ -837,8 +843,8 @@ Do not read this bracket data block out loud to the caller.`;
                         if (businessId) {
                             const bizSettings = await getBusinessSettings(businessId);
                             if (bizSettings) {
-                                liveCallTasksPrompt = bizSettings.live_call_tasks_prompt || '';
-                                fallbackEmailTemplate = bizSettings.fallback_email_template || '';
+                                emailCollectionEnabled = bizSettings.email_collection_enabled || false;
+                                forceEmailCollection = bizSettings.force_email_collection || false;
                             }
                         }
 
