@@ -199,12 +199,15 @@ function mixSoundIntoAudio(geminiPcm, soundSamples, soundOffset, volumePct) {
     return { mixed, newOffset: offset };
 }
 
-async function createCallRecord({ businessId, contactId, direction, twilioCallSid, maxDurationLimit }) {
+// Ensure Campaign IDs and Target Numbers are written to the database Call row
+async function createCallRecord({ businessId, contactId, campaignId, targetNumber, direction, twilioCallSid, maxDurationLimit }) {
     const { data, error } = await supabase
         .from('calls')
         .insert({
             business_id: businessId || null,
             contact_id: contactId || null,
+            campaign_id: campaignId || null,
+            target_number: targetNumber || null,
             direction,
             status: 'in-progress',
             twilio_call_sid: twilioCallSid || null,
@@ -309,10 +312,11 @@ fastify.all('/incoming-call', async (request, reply) => {
         <Stream url="wss://${request.headers.host}/media-stream">
             <Parameter name="businessId" value="${request.query.businessId || ''}" />
             <Parameter name="contactId" value="${request.query.contactId || ''}" />
+            <Parameter name="campaignId" value="${request.query.campaignId || ''}" />
+            <Parameter name="targetNumber" value="${request.query.targetNumber || ''}" />
             <Parameter name="direction" value="${request.query.direction || 'inbound'}" />
             <Parameter name="agentId" value="${request.query.agentId || ''}" />
             <Parameter name="groupId" value="${request.query.groupId || ''}" />
-            <Parameter name="campaignId" value="${request.query.campaignId || ''}" />
             <Parameter name="maxDuration" value="${request.query.maxDuration || '120'}" />
         </Stream>
     </Connect>
@@ -351,6 +355,7 @@ fastify.post('/make-call', async (request, reply) => {
         const credentials = Buffer.from(`${userTwilioSid}:${userTwilioAuth}`).toString('base64');
         const webhookUrl = new URL(`https://${request.headers.host}/incoming-call`);
         webhookUrl.searchParams.set('businessId', businessId);
+        webhookUrl.searchParams.set('targetNumber', to);
         if (contactId) webhookUrl.searchParams.set('contactId', contactId);
         if (agentId) webhookUrl.searchParams.set('agentId', agentId);
         if (groupId) webhookUrl.searchParams.set('groupId', groupId);
@@ -414,6 +419,8 @@ fastify.register(async (fastify) => {
         let callId = null;
         let businessId = null;
         let contactId = null;
+        let campaignId = null;
+        let targetNumber = null;
         let direction = 'inbound';
         let callStartTime = null;
         let callerTranscriptParts = [];
@@ -779,11 +786,16 @@ fastify.register(async (fastify) => {
                         const agentId = params.agentId || null;
                         const groupId = params.groupId || null;
                         
-                        let campaignId = params.campaignId;
+                        campaignId = params.campaignId;
                         if (!campaignId || campaignId === 'null' || campaignId === 'undefined') {
                             campaignId = null;
                         }
                         
+                        targetNumber = params.targetNumber;
+                        if (!targetNumber || targetNumber === 'null' || targetNumber === 'undefined') {
+                            targetNumber = null;
+                        }
+
                         const maxDurationSec = parseInt(params.maxDuration || '120', 10);
 
                         if (businessId) {
@@ -830,7 +842,9 @@ fastify.register(async (fastify) => {
 
                         callId = await createCallRecord({ 
                             businessId, 
-                            contactId, 
+                            contactId,
+                            campaignId,
+                            targetNumber,
                             direction, 
                             twilioCallSid: streamSid,
                             maxDurationLimit: maxDurationSec 
