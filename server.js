@@ -101,7 +101,7 @@ function mulawToLinear(u) {
 function linearToMulaw(sample) {
     const MULAW_MAX = 0x1FFF;
     const MULAW_BIAS = 33;
-    const exp_lut = [0,1,2,2,3,3,3,3,4,4,4,4,4,4,4,4,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,
+    const exp_lut = [0,1,2,2,3,3,3,3,4,4,4,4,4,4,4,4,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,exp_lut
                      6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,
                      7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,
                      7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7];
@@ -199,7 +199,6 @@ function mixSoundIntoAudio(geminiPcm, soundSamples, soundOffset, volumePct) {
     return { mixed, newOffset: offset };
 }
 
-// WebSocket Connection Record Creation
 async function createCallRecord({ businessId, contactId, campaignId, targetNumber, direction, twilioCallSid, maxDurationLimit }) {
     const { data, error } = await supabase
         .from('calls')
@@ -261,7 +260,6 @@ async function getGroupById(groupId) {
     return data;
 }
 
-// --- SMART SETTINGS ENGINE ---
 async function getActiveCallSettings(businessId, campaignId) {
     if (!businessId) return null;
     const { data: biz, error } = await supabase
@@ -301,15 +299,13 @@ fastify.get('/', async (request, reply) => {
     reply.send({ message: 'Twilio + Gemini Live API Media Stream Server is running!' });
 });
 
-// --- NEW ROUTE: TWILIO CALL STATUS WEBHOOK (Captures Unanswered / Rejected Calls) ---
+// --- GLOBAL CALL STATUS CALLBACK WEBHOOK ---
 fastify.post('/call-status', async (request, reply) => {
-    // Twilio sends form-encoded data indicating terminal status: 'completed', 'busy', 'no-answer', 'canceled', 'failed'
     const { CallSid, CallStatus } = request.body;
     const { businessId, campaignId, targetNumber, contactId } = request.query;
 
-    console.log(`[TWILIO STATUS PING] Call ${CallSid} to ${targetNumber} finalized. Status: ${CallStatus}`);
+    console.log(`[TWILIO STATUS PING] Call ${CallSid} received status: ${CallStatus}`);
 
-    // Check if the WebSocket stream ever managed to create a database record for this call
     const { data: existingCall } = await supabase
         .from('calls')
         .select('id, status')
@@ -317,34 +313,35 @@ fastify.post('/call-status', async (request, reply) => {
         .single();
 
     if (existingCall) {
-        // Record exists (WebSocket connected). Just ensure terminal status is synced if Twilio threw an error.
-        if (CallStatus !== 'in-progress' && CallStatus !== 'ringing') {
+        // If a row exists, ensure it maps to the right status if ended
+        if (CallStatus !== 'in-progress' && CallStatus !== 'ringing' && CallStatus !== 'initiated' && CallStatus !== 'queued') {
             await supabase.from('calls').update({ 
                 status: CallStatus,
                 ended_at: new Date().toISOString()
             }).eq('id', existingCall.id);
         }
     } else {
-        // Record DOES NOT EXIST! This means the user rejected it, was busy, or never picked up.
-        // We MUST record this failure so the Campaign Orchestrator knows to retry it later.
-        console.log(`[SYS] Creating fallback failure record for unanswered call: ${targetNumber} (${CallStatus})`);
-        
-        let cId = campaignId;
-        if (!cId || cId === 'null' || cId === 'undefined') cId = null;
+        // CRITICAL FIX: If Call dropped out before Media Stream triggered, record the result immediately!
+        if (CallStatus === 'busy' || CallStatus === 'no-answer' || CallStatus === 'canceled' || CallStatus === 'failed' || CallStatus === 'completed') {
+            console.log(`[SYS] Logging connection drop for ${targetNumber} as: ${CallStatus}`);
+            
+            let cId = campaignId;
+            if (!cId || cId === 'null' || cId === 'undefined') cId = null;
 
-        await supabase.from('calls').insert({
-            business_id: businessId || null,
-            contact_id: contactId || null,
-            campaign_id: cId,
-            target_number: targetNumber || null,
-            direction: 'outbound',
-            status: CallStatus, // Usually 'no-answer', 'busy', or 'failed'
-            twilio_call_sid: CallSid,
-            duration_seconds: 0,
-            credits_used: 0,
-            started_at: new Date().toISOString(),
-            ended_at: new Date().toISOString()
-        });
+            await supabase.from('calls').insert({
+                business_id: businessId || null,
+                contact_id: contactId || null,
+                campaign_id: cId,
+                target_number: targetNumber || null,
+                direction: 'outbound',
+                status: CallStatus, 
+                twilio_call_sid: CallSid,
+                duration_seconds: 0,
+                credits_used: 0,
+                started_at: new Date().toISOString(),
+                ended_at: new Date().toISOString()
+            });
+        }
     }
 
     reply.send({ received: true });
@@ -399,7 +396,6 @@ fastify.post('/make-call', async (request, reply) => {
     try {
         const credentials = Buffer.from(`${userTwilioSid}:${userTwilioAuth}`).toString('base64');
         
-        // 1. TwiML Stream URL
         const webhookUrl = new URL(`https://${request.headers.host}/incoming-call`);
         webhookUrl.searchParams.set('businessId', businessId);
         webhookUrl.searchParams.set('targetNumber', to);
@@ -410,7 +406,6 @@ fastify.post('/make-call', async (request, reply) => {
         webhookUrl.searchParams.set('maxDuration', maxDuration || '120');
         webhookUrl.searchParams.set('direction', 'outbound');
 
-        // 2. Status Callback URL (Pings server if dropped/rejected before AI answers)
         const statusCallbackUrl = new URL(`https://${request.headers.host}/call-status`);
         statusCallbackUrl.searchParams.set('businessId', businessId);
         statusCallbackUrl.searchParams.set('targetNumber', to);
@@ -430,7 +425,9 @@ fastify.post('/make-call', async (request, reply) => {
                     From: userTwilioNumber, 
                     Url: webhookUrl.toString(),
                     StatusCallback: statusCallbackUrl.toString(),
-                    StatusCallbackMethod: 'POST'
+                    StatusCallbackMethod: 'POST',
+                    // FIXED: Subscribe explicitly to progress events so busy/rejections trigger hooks
+                    StatusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed'].join(' ')
                 }).toString()
             }
         );
@@ -482,17 +479,14 @@ fastify.register(async (fastify) => {
         let callerTranscriptParts = [];
         let geminiTranscriptParts = [];
 
-        // Multi-Agent Architecture State
         let isGroupCall = false;
         let groupRoutingConditions = '';
         let availableAgents = [];
         let currentAgent = null;
 
-        // Automated Task Rules Configuration
         let liveCallTasksPrompt = '';
         let capturedExtractedData = null;
 
-        // --- MASTER CALL TERMINATION ENGINE ---
         const endCall = async (reason = 'timeout') => {
             if (callEnded) return;
 
@@ -896,7 +890,6 @@ fastify.register(async (fastify) => {
 
                         connectGemini();
 
-                        // The call connected! Create the database record here.
                         callId = await createCallRecord({ 
                             businessId, 
                             contactId,
