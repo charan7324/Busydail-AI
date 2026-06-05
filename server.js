@@ -199,7 +199,7 @@ function mixSoundIntoAudio(geminiPcm, soundSamples, soundOffset, volumePct) {
     return { mixed, newOffset: offset };
 }
 
-// Ensure Campaign IDs and Target Numbers are written to the database Call row
+// WebSocket Connection Record Creation
 async function createCallRecord({ businessId, contactId, campaignId, targetNumber, direction, twilioCallSid, maxDurationLimit }) {
     const { data, error } = await supabase
         .from('calls')
@@ -264,8 +264,6 @@ async function getGroupById(groupId) {
 // --- SMART SETTINGS ENGINE ---
 async function getActiveCallSettings(businessId, campaignId) {
     if (!businessId) return null;
-    
-    // Read from global workspace settings
     const { data: biz, error } = await supabase
         .from('businesses')
         .select('live_call_tasks_prompt')
@@ -273,9 +271,7 @@ async function getActiveCallSettings(businessId, campaignId) {
         .single();
 
     if (error || !biz) return null;
-    return {
-        liveCallTasksPrompt: biz.live_call_tasks_prompt || ''
-    };
+    return { liveCallTasksPrompt: biz.live_call_tasks_prompt || '' };
 }
 
 async function generateCallSummary(callerTranscript, geminiTranscript) {
@@ -303,6 +299,55 @@ async function generateCallSummary(callerTranscript, geminiTranscript) {
 
 fastify.get('/', async (request, reply) => {
     reply.send({ message: 'Twilio + Gemini Live API Media Stream Server is running!' });
+});
+
+// --- NEW ROUTE: TWILIO CALL STATUS WEBHOOK (Captures Unanswered / Rejected Calls) ---
+fastify.post('/call-status', async (request, reply) => {
+    // Twilio sends form-encoded data indicating terminal status: 'completed', 'busy', 'no-answer', 'canceled', 'failed'
+    const { CallSid, CallStatus } = request.body;
+    const { businessId, campaignId, targetNumber, contactId } = request.query;
+
+    console.log(`[TWILIO STATUS PING] Call ${CallSid} to ${targetNumber} finalized. Status: ${CallStatus}`);
+
+    // Check if the WebSocket stream ever managed to create a database record for this call
+    const { data: existingCall } = await supabase
+        .from('calls')
+        .select('id, status')
+        .eq('twilio_call_sid', CallSid)
+        .single();
+
+    if (existingCall) {
+        // Record exists (WebSocket connected). Just ensure terminal status is synced if Twilio threw an error.
+        if (CallStatus !== 'in-progress' && CallStatus !== 'ringing') {
+            await supabase.from('calls').update({ 
+                status: CallStatus,
+                ended_at: new Date().toISOString()
+            }).eq('id', existingCall.id);
+        }
+    } else {
+        // Record DOES NOT EXIST! This means the user rejected it, was busy, or never picked up.
+        // We MUST record this failure so the Campaign Orchestrator knows to retry it later.
+        console.log(`[SYS] Creating fallback failure record for unanswered call: ${targetNumber} (${CallStatus})`);
+        
+        let cId = campaignId;
+        if (!cId || cId === 'null' || cId === 'undefined') cId = null;
+
+        await supabase.from('calls').insert({
+            business_id: businessId || null,
+            contact_id: contactId || null,
+            campaign_id: cId,
+            target_number: targetNumber || null,
+            direction: 'outbound',
+            status: CallStatus, // Usually 'no-answer', 'busy', or 'failed'
+            twilio_call_sid: CallSid,
+            duration_seconds: 0,
+            credits_used: 0,
+            started_at: new Date().toISOString(),
+            ended_at: new Date().toISOString()
+        });
+    }
+
+    reply.send({ received: true });
 });
 
 fastify.all('/incoming-call', async (request, reply) => {
@@ -353,6 +398,8 @@ fastify.post('/make-call', async (request, reply) => {
 
     try {
         const credentials = Buffer.from(`${userTwilioSid}:${userTwilioAuth}`).toString('base64');
+        
+        // 1. TwiML Stream URL
         const webhookUrl = new URL(`https://${request.headers.host}/incoming-call`);
         webhookUrl.searchParams.set('businessId', businessId);
         webhookUrl.searchParams.set('targetNumber', to);
@@ -362,6 +409,13 @@ fastify.post('/make-call', async (request, reply) => {
         if (campaignId) webhookUrl.searchParams.set('campaignId', campaignId);
         webhookUrl.searchParams.set('maxDuration', maxDuration || '120');
         webhookUrl.searchParams.set('direction', 'outbound');
+
+        // 2. Status Callback URL (Pings server if dropped/rejected before AI answers)
+        const statusCallbackUrl = new URL(`https://${request.headers.host}/call-status`);
+        statusCallbackUrl.searchParams.set('businessId', businessId);
+        statusCallbackUrl.searchParams.set('targetNumber', to);
+        if (campaignId) statusCallbackUrl.searchParams.set('campaignId', campaignId);
+        if (contactId) statusCallbackUrl.searchParams.set('contactId', contactId);
 
         const response = await fetch(
             `https://api.twilio.com/2010-04-01/Accounts/${userTwilioSid}/Calls.json`,
@@ -374,7 +428,9 @@ fastify.post('/make-call', async (request, reply) => {
                 body: new URLSearchParams({ 
                     To: to, 
                     From: userTwilioNumber, 
-                    Url: webhookUrl.toString() 
+                    Url: webhookUrl.toString(),
+                    StatusCallback: statusCallbackUrl.toString(),
+                    StatusCallbackMethod: 'POST'
                 }).toString()
             }
         );
@@ -840,6 +896,7 @@ fastify.register(async (fastify) => {
 
                         connectGemini();
 
+                        // The call connected! Create the database record here.
                         callId = await createCallRecord({ 
                             businessId, 
                             contactId,
