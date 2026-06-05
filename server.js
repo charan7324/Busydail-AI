@@ -101,7 +101,7 @@ function mulawToLinear(u) {
 function linearToMulaw(sample) {
     const MULAW_MAX = 0x1FFF;
     const MULAW_BIAS = 33;
-    const exp_lut = [0,1,2,2,3,3,3,3,4,4,4,4,4,4,4,4,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,exp_lut
+    const exp_lut = [0,1,2,2,3,3,3,3,4,4,4,4,4,4,4,4,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,
                      6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,
                      7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,
                      7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7];
@@ -313,7 +313,6 @@ fastify.post('/call-status', async (request, reply) => {
         .single();
 
     if (existingCall) {
-        // If a row exists, ensure it maps to the right status if ended
         if (CallStatus !== 'in-progress' && CallStatus !== 'ringing' && CallStatus !== 'initiated' && CallStatus !== 'queued') {
             await supabase.from('calls').update({ 
                 status: CallStatus,
@@ -321,7 +320,6 @@ fastify.post('/call-status', async (request, reply) => {
             }).eq('id', existingCall.id);
         }
     } else {
-        // CRITICAL FIX: If Call dropped out before Media Stream triggered, record the result immediately!
         if (CallStatus === 'busy' || CallStatus === 'no-answer' || CallStatus === 'canceled' || CallStatus === 'failed' || CallStatus === 'completed') {
             console.log(`[SYS] Logging connection drop for ${targetNumber} as: ${CallStatus}`);
             
@@ -426,7 +424,6 @@ fastify.post('/make-call', async (request, reply) => {
                     Url: webhookUrl.toString(),
                     StatusCallback: statusCallbackUrl.toString(),
                     StatusCallbackMethod: 'POST',
-                    // FIXED: Subscribe explicitly to progress events so busy/rejections trigger hooks
                     StatusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed'].join(' ')
                 }).toString()
             }
