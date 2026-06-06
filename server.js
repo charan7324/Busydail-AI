@@ -89,34 +89,23 @@ const BACKGROUND_SOUND_URLS = {
 const soundCache = {};
 
 function mulawToLinear(u) {
-    u = ~u & 0xFF;
-    let sign = u & 0x80;
-    let exponent = (u >> 4) & 0x07;
-    let mantissa = u & 0x0F;
-    let sample = ((mantissa << 1) + 33) << exponent;
-    sample -= 33;
-    return sign ? -sample : sample;
+    u = ~u & 0xFF; let sign = u & 0x80; let exponent = (u >> 4) & 0x07; let mantissa = u & 0x0F;
+    let sample = ((mantissa << 1) + 33) << exponent; sample -= 33; return sign ? -sample : sample;
 }
 
 function linearToMulaw(sample) {
-    const MULAW_MAX = 0x1FFF;
-    const MULAW_BIAS = 33;
+    const MULAW_MAX = 0x1FFF; const MULAW_BIAS = 33;
     const exp_lut = [0,1,2,2,3,3,3,3,4,4,4,4,4,4,4,4,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,
                      6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,
                      7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,
                      7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7];
-    let sign = (sample >> 8) & 0x80;
-    if (sign) sample = -sample;
-    if (sample > MULAW_MAX) sample = MULAW_MAX;
-    sample += MULAW_BIAS;
-    let exponent = exp_lut[(sample >> 7) & 0xFF];
-    let mantissa = (sample >> (exponent + 3)) & 0x0F;
+    let sign = (sample >> 8) & 0x80; if (sign) sample = -sample; if (sample > MULAW_MAX) sample = MULAW_MAX;
+    sample += MULAW_BIAS; let exponent = exp_lut[(sample >> 7) & 0xFF]; let mantissa = (sample >> (exponent + 3)) & 0x0F;
     return ~(sign | (exponent << 4) | mantissa) & 0xFF;
 }
 
 function mulawBase64ToPcm16Base64(mulawBase64) {
-    const mulawBuf = Buffer.from(mulawBase64, 'base64');
-    const pcm8k = new Int16Array(mulawBuf.length);
+    const mulawBuf = Buffer.from(mulawBase64, 'base64'); const pcm8k = new Int16Array(mulawBuf.length);
     for (let i = 0; i < mulawBuf.length; i++) pcm8k[i] = mulawToLinear(mulawBuf[i]);
     const pcm16k = new Int16Array(pcm8k.length * 2);
     for (let i = 0; i < pcm8k.length - 1; i++) {
@@ -129,219 +118,126 @@ function mulawBase64ToPcm16Base64(mulawBase64) {
 }
 
 function pcm16Base64ToMulawBase64(pcm16Base64) {
-    const pcmBuf = Buffer.from(pcm16Base64, 'base64');
-    const pcm24k = new Int16Array(pcmBuf.buffer, pcmBuf.byteOffset, pcmBuf.byteLength / 2);
-    const outLen = Math.floor(pcm24k.length / 3);
-    const mulaw8k = Buffer.alloc(outLen);
-    for (let i = 0; i < outLen; i++) mulaw8k[i] = linearToMulaw(pcm24k[i * 3]);
-    return mulaw8k.toString('base64');
+    const pcmBuf = Buffer.from(pcm16Base64, 'base64'); const pcm24k = new Int16Array(pcmBuf.buffer, pcmBuf.byteOffset, pcmBuf.byteLength / 2);
+    const outLen = Math.floor(pcm24k.length / 3); const mulaw8k = Buffer.alloc(outLen);
+    for (let i = 0; i < outLen; i++) mulaw8k[i] = linearToMulaw(pcm24k[i * 3]); return mulaw8k.toString('base64');
 }
 
 function convertAudioToPcm24k(inputBuffer) {
     return new Promise((resolve, reject) => {
         const chunks = [];
-        const ff = spawn('ffmpeg', [
-            '-i', 'pipe:0',
-            '-f', 's16le',
-            '-ar', '24000',
-            '-ac', '1',
-            '-loglevel', 'quiet',
-            'pipe:1'
-        ]);
-
+        const ff = spawn('ffmpeg', ['-i', 'pipe:0', '-f', 's16le', '-ar', '24000', '-ac', '1', '-loglevel', 'quiet', 'pipe:1']);
         ff.stdout.on('data', chunk => chunks.push(chunk));
-        ff.stdout.on('end', () => {
-            const pcmBuf = Buffer.concat(chunks);
-            resolve(new Int16Array(pcmBuf.buffer, pcmBuf.byteOffset, pcmBuf.byteLength / 2));
-        });
-        ff.stderr.on('data', () => {});
+        ff.stdout.on('end', () => { const pcmBuf = Buffer.concat(chunks); resolve(new Int16Array(pcmBuf.buffer, pcmBuf.byteOffset, pcmBuf.byteLength / 2)); });
         ff.on('error', (err) => reject(new Error(`ffmpeg error: ${err.message}`)));
-        ff.stdin.on('error', () => {});
-
-        ff.stdin.write(inputBuffer);
-        ff.stdin.end();
+        ff.stdin.write(inputBuffer); ff.stdin.end();
     });
 }
 
 async function loadSoundPCM(soundId) {
     if (soundCache[soundId]) return soundCache[soundId];
-    const url = BACKGROUND_SOUND_URLS[soundId];
-    if (!url) return null;
-
+    if (!BACKGROUND_SOUND_URLS[soundId]) return null;
     try {
-        const response = await fetch(url);
+        const response = await fetch(BACKGROUND_SOUND_URLS[soundId]);
         if (!response.ok) throw new Error(`HTTP ${response.status} for sound ${soundId}`);
-        const audioBuffer = Buffer.from(await response.arrayBuffer());
-        const pcmSamples = await convertAudioToPcm24k(audioBuffer);
-        soundCache[soundId] = pcmSamples;
-        return pcmSamples;
-    } catch (err) {
-        console.error(`Failed to load sound ${soundId}:`, err.message);
-        return null;
-    }
+        const pcmSamples = await convertAudioToPcm24k(Buffer.from(await response.arrayBuffer()));
+        soundCache[soundId] = pcmSamples; return pcmSamples;
+    } catch (err) { console.error(`Failed to load sound ${soundId}:`, err.message); return null; }
 }
 
 function mixSoundIntoAudio(geminiPcm, soundSamples, soundOffset, volumePct) {
-    if (!soundSamples || soundSamples.length === 0) {
-        return { mixed: geminiPcm, newOffset: soundOffset };
-    }
+    if (!soundSamples || soundSamples.length === 0) return { mixed: geminiPcm, newOffset: soundOffset };
     const vol = Math.max(0, Math.min(100, volumePct)) / 100;
-    const mixed = new Int16Array(geminiPcm.length);
-    let offset = soundOffset;
-
+    const mixed = new Int16Array(geminiPcm.length); let offset = soundOffset;
     for (let i = 0; i < geminiPcm.length; i++) {
-        const bgSample = soundSamples[offset % soundSamples.length];
-        const gemSample = geminiPcm[i];
-        const mixedVal = gemSample + Math.round(bgSample * vol);
-        mixed[i] = Math.max(-32768, Math.min(32767, mixedVal));
+        mixed[i] = Math.max(-32768, Math.min(32767, geminiPcm[i] + Math.round(soundSamples[offset % soundSamples.length] * vol)));
         offset++;
     }
     return { mixed, newOffset: offset };
 }
 
 async function createCallRecord({ businessId, contactId, campaignId, targetNumber, direction, twilioCallSid, maxDurationLimit }) {
-    const { data, error } = await supabase
-        .from('calls')
-        .insert({
-            business_id: businessId || null,
-            contact_id: contactId || null,
-            campaign_id: campaignId || null,
-            target_number: targetNumber || null,
-            direction,
-            status: 'in-progress',
-            twilio_call_sid: twilioCallSid || null,
-            max_duration_limit: maxDurationLimit || 120,
-            started_at: new Date().toISOString()
-        })
-        .select()
-        .single();
+    const { data, error } = await supabase.from('calls').insert({
+        business_id: businessId || null, contact_id: contactId || null, campaign_id: campaignId || null,
+        target_number: targetNumber || null, direction, status: 'initiated', twilio_call_sid: twilioCallSid || null,
+        max_duration_limit: maxDurationLimit || 120, started_at: new Date().toISOString()
+    }).select().maybeSingle();
     if (error) { console.error('Error creating call record:', error.message); return null; }
-    return data.id;
+    return data ? data.id : null;
 }
 
 async function updateCallRecord(callId, { status, callerTranscript, geminiTranscript, durationSeconds, summary, creditsUsed }) {
     if (!callId) return;
-    const { error } = await supabase
-        .from('calls')
-        .update({
-            status,
-            caller_transcript: callerTranscript || null,
-            gemini_transcript: geminiTranscript || null,
-            duration_seconds: durationSeconds || 0,
-            credits_used: creditsUsed || 0,
-            summary: summary || null,
-            ended_at: new Date().toISOString()
-        })
-        .eq('id', callId);
-    if (error) console.error('Error updating call record:', error.message);
+    await supabase.from('calls').update({
+        status, caller_transcript: callerTranscript || null, gemini_transcript: geminiTranscript || null,
+        duration_seconds: durationSeconds || 0, credits_used: creditsUsed || 0, summary: summary || null,
+        ended_at: new Date().toISOString()
+    }).eq('id', callId);
 }
 
 async function incrementBusinessCallCount(businessId) {
     if (!businessId) return;
-    const { error } = await supabase.rpc('increment_calls_used', { business_id_input: businessId });
-    if (error) console.error('Error incrementing call count:', error.message);
+    await supabase.rpc('increment_calls_used', { business_id_input: businessId });
 }
 
 async function getAgentById(agentId) {
     if (!agentId) return null;
-    const { data, error } = await supabase.from('agents').select('*').eq('id', agentId).single();
-    if (error) return null;
+    const { data } = await supabase.from('agents').select('*').eq('id', agentId).maybeSingle();
     return data;
 }
 
 async function getGroupById(groupId) {
     if (!groupId) return null;
-    const { data, error } = await supabase
-        .from('ai_groups')
-        .select(`id, name, routing_conditions, primary_agent_id, group_members(agent_id)`)
-        .eq('id', groupId)
-        .single();
-    if (error) return null;
+    const { data } = await supabase.from('ai_groups').select(`id, name, routing_conditions, primary_agent_id, group_members(agent_id)`).eq('id', groupId).maybeSingle();
     return data;
 }
 
 async function getActiveCallSettings(businessId, campaignId) {
     if (!businessId) return null;
-    const { data: biz, error } = await supabase
-        .from('businesses')
-        .select('live_call_tasks_prompt')
-        .eq('id', businessId)
-        .single();
-
-    if (error || !biz) return null;
-    return { liveCallTasksPrompt: biz.live_call_tasks_prompt || '' };
+    const { data } = await supabase.from('businesses').select('live_call_tasks_prompt').eq('id', businessId).maybeSingle();
+    return data ? { liveCallTasksPrompt: data.live_call_tasks_prompt || '' } : null;
 }
 
 async function generateCallSummary(callerTranscript, geminiTranscript) {
     if (!callerTranscript && !geminiTranscript) return null;
     try {
         const fullTranscript = [callerTranscript, geminiTranscript].filter(Boolean).join('\n').trim();
-        const response = await fetch(
-            `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=${GEMINI_API_KEY}`,
-            {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    contents: [{ parts: [{ text: `Summarize this phone call in 3-4 bullet points. Cover what was discussed, decisions made, and next steps. Be concise and professional. Only return bullet points, no intro text.\n\nTranscript:\n${fullTranscript}` }] }],
-                    generationConfig: { maxOutputTokens: 300, temperature: 0.2 }
-                })
-            }
-        );
+        const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=${GEMINI_API_KEY}`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                contents: [{ parts: [{ text: `Summarize this phone call in 3-4 bullet points. Cover what was discussed, decisions made, and next steps. Be concise and professional. Only return bullet points, no intro text.\n\nTranscript:\n${fullTranscript}` }] }],
+                generationConfig: { maxOutputTokens: 300, temperature: 0.2 }
+            })
+        });
         const data = await response.json();
-        if (data.error) return null;
         return data.candidates?.[0]?.content?.parts?.[0]?.text || null;
-    } catch (err) {
-        return null;
-    }
+    } catch (err) { return null; }
 }
 
-fastify.get('/', async (request, reply) => {
-    reply.send({ message: 'Twilio + Gemini Live API Media Stream Server is running!' });
-});
+fastify.get('/', async (request, reply) => { reply.send({ message: 'Twilio + Gemini Live API is running!' }); });
 
-// --- GLOBAL CALL STATUS CALLBACK WEBHOOK ---
+// --- CRASH-PROOF GLOBAL CALL STATUS CALLBACK WEBHOOK ---
 fastify.post('/call-status', async (request, reply) => {
     const { CallSid, CallStatus } = request.body;
     const { businessId, campaignId, targetNumber, contactId } = request.query;
+    console.log(`[TWILIO STATUS] ${CallSid} => ${CallStatus}`);
 
-    console.log(`[TWILIO STATUS PING] Call ${CallSid} received status: ${CallStatus}`);
-
-    const { data: existingCall } = await supabase
-        .from('calls')
-        .select('id, status')
-        .eq('twilio_call_sid', CallSid)
-        .single();
+    // Use maybeSingle to PREVENT crash if DB is lagging
+    const { data: existingCall } = await supabase.from('calls').select('id, status').eq('twilio_call_sid', CallSid).maybeSingle();
 
     if (existingCall) {
-        if (CallStatus !== 'in-progress' && CallStatus !== 'ringing' && CallStatus !== 'initiated' && CallStatus !== 'queued') {
-            await supabase.from('calls').update({ 
-                status: CallStatus,
-                ended_at: new Date().toISOString()
-            }).eq('id', existingCall.id);
+        if (['busy', 'no-answer', 'canceled', 'failed', 'completed'].includes(CallStatus)) {
+            await supabase.from('calls').update({ status: CallStatus, ended_at: new Date().toISOString() }).eq('id', existingCall.id);
         }
     } else {
-        if (CallStatus === 'busy' || CallStatus === 'no-answer' || CallStatus === 'canceled' || CallStatus === 'failed' || CallStatus === 'completed') {
-            console.log(`[SYS] Logging connection drop for ${targetNumber} as: ${CallStatus}`);
-            
-            let cId = campaignId;
-            if (!cId || cId === 'null' || cId === 'undefined') cId = null;
-
+        if (['busy', 'no-answer', 'canceled', 'failed', 'completed'].includes(CallStatus)) {
             await supabase.from('calls').insert({
-                business_id: businessId || null,
-                contact_id: contactId || null,
-                campaign_id: cId,
-                target_number: targetNumber || null,
-                direction: 'outbound',
-                status: CallStatus, 
-                twilio_call_sid: CallSid,
-                duration_seconds: 0,
-                credits_used: 0,
-                started_at: new Date().toISOString(),
-                ended_at: new Date().toISOString()
+                business_id: businessId || null, contact_id: contactId || null, campaign_id: campaignId !== 'null' ? campaignId : null,
+                target_number: targetNumber || null, direction: 'outbound', status: CallStatus, twilio_call_sid: CallSid,
+                duration_seconds: 0, credits_used: 0, started_at: new Date().toISOString(), ended_at: new Date().toISOString()
             });
         }
     }
-
     reply.send({ received: true });
 });
 
@@ -366,605 +262,188 @@ fastify.all('/incoming-call', async (request, reply) => {
 
 fastify.post('/make-call', async (request, reply) => {
     const { to, businessId, contactId, agentId, groupId, campaignId, maxDuration } = request.body;
-    if (!to) return reply.status(400).send({ error: 'Missing "to" phone number' });
-    if (!businessId) return reply.status(400).send({ error: 'Missing business ID' });
+    if (!to || !businessId) return reply.status(400).send({ error: 'Missing parameters' });
 
-    const { data: businessData, error: dbError } = await supabase
-        .from('businesses')
-        .select('twilio_account_sid, twilio_auth_token, twilio_number, credits_balance')
-        .eq('id', businessId)
-        .single();
-
-    if (dbError || !businessData) {
-        return reply.status(500).send({ error: 'Failed to retrieve business profile.' });
-    }
-
-    if (businessData.credits_balance <= 0) {
-        return reply.status(402).send({ error: 'Insufficient credits. Please top up your balance.' });
-    }
-
-    if (!businessData.twilio_account_sid || !businessData.twilio_auth_token || !businessData.twilio_number) {
-        return reply.status(400).send({ error: 'Twilio credentials not configured. Please update your Settings.' });
-    }
+    const { data: businessData, error: dbError } = await supabase.from('businesses').select('twilio_account_sid, twilio_auth_token, twilio_number, credits_balance').eq('id', businessId).maybeSingle();
+    if (dbError || !businessData) return reply.status(500).send({ error: 'Failed to retrieve business profile.' });
+    if (businessData.credits_balance <= 0) return reply.status(402).send({ error: 'Insufficient credits.' });
 
     const userTwilioSid = businessData.twilio_account_sid.trim();
     const userTwilioAuth = businessData.twilio_auth_token.trim();
-    const userTwilioNumber = businessData.twilio_number.trim();
+    const credentials = Buffer.from(`${userTwilioSid}:${userTwilioAuth}`).toString('base64');
+    
+    const webhookUrl = new URL(`https://${request.headers.host}/incoming-call`);
+    webhookUrl.searchParams.set('businessId', businessId);
+    webhookUrl.searchParams.set('targetNumber', to);
+    if (contactId) webhookUrl.searchParams.set('contactId', contactId);
+    if (agentId) webhookUrl.searchParams.set('agentId', agentId);
+    if (groupId) webhookUrl.searchParams.set('groupId', groupId);
+    if (campaignId) webhookUrl.searchParams.set('campaignId', campaignId);
+    webhookUrl.searchParams.set('maxDuration', maxDuration || '120');
+    webhookUrl.searchParams.set('direction', 'outbound');
+
+    const statusCallbackUrl = new URL(`https://${request.headers.host}/call-status`);
+    statusCallbackUrl.searchParams.set('businessId', businessId);
+    statusCallbackUrl.searchParams.set('targetNumber', to);
+    if (campaignId) statusCallbackUrl.searchParams.set('campaignId', campaignId);
 
     try {
-        const credentials = Buffer.from(`${userTwilioSid}:${userTwilioAuth}`).toString('base64');
-        
-        const webhookUrl = new URL(`https://${request.headers.host}/incoming-call`);
-        webhookUrl.searchParams.set('businessId', businessId);
-        webhookUrl.searchParams.set('targetNumber', to);
-        if (contactId) webhookUrl.searchParams.set('contactId', contactId);
-        if (agentId) webhookUrl.searchParams.set('agentId', agentId);
-        if (groupId) webhookUrl.searchParams.set('groupId', groupId);
-        if (campaignId) webhookUrl.searchParams.set('campaignId', campaignId);
-        webhookUrl.searchParams.set('maxDuration', maxDuration || '120');
-        webhookUrl.searchParams.set('direction', 'outbound');
-
-        const statusCallbackUrl = new URL(`https://${request.headers.host}/call-status`);
-        statusCallbackUrl.searchParams.set('businessId', businessId);
-        statusCallbackUrl.searchParams.set('targetNumber', to);
-        if (campaignId) statusCallbackUrl.searchParams.set('campaignId', campaignId);
-        if (contactId) statusCallbackUrl.searchParams.set('contactId', contactId);
-
-        const response = await fetch(
-            `https://api.twilio.com/2010-04-01/Accounts/${userTwilioSid}/Calls.json`,
-            {
-                method: 'POST',
-                headers: { 
-                    'Authorization': `Basic ${credentials}`, 
-                    'Content-Type': 'application/x-www-form-urlencoded' 
-                },
-                body: new URLSearchParams({ 
-                    To: to, 
-                    From: userTwilioNumber, 
-                    Url: webhookUrl.toString(),
-                    StatusCallback: statusCallbackUrl.toString(),
-                    StatusCallbackMethod: 'POST',
-                    StatusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed'].join(' ')
-                }).toString()
-            }
-        );
+        const response = await fetch(`https://api.twilio.com/2010-04-01/Accounts/${userTwilioSid}/Calls.json`, {
+            method: 'POST',
+            headers: { 'Authorization': `Basic ${credentials}`, 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: new URLSearchParams({ 
+                To: to, From: businessData.twilio_number.trim(), Url: webhookUrl.toString(),
+                StatusCallback: statusCallbackUrl.toString(), StatusCallbackMethod: 'POST',
+                StatusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed'].join(' ')
+            }).toString()
+        });
 
         const data = await response.json();
         if (data.sid) {
+            await createCallRecord({ businessId, contactId, campaignId, targetNumber: to, direction: 'outbound', twilioCallSid: data.sid, maxDurationLimit: maxDuration });
             reply.send({ success: true, callSid: data.sid, to });
         } else {
-            reply.status(500).send({ success: false, error: data.message || 'Failed to initiate call via your Twilio account' });
+            reply.status(500).send({ success: false, error: data.message });
         }
-    } catch (err) {
-        reply.status(500).send({ success: false, error: err.message });
-    }
+    } catch (err) { reply.status(500).send({ success: false, error: err.message }); }
 });
 
 fastify.register(async (fastify) => {
     fastify.get('/media-stream', { websocket: true }, (connection, req) => {
-        
-        let geminiWs = null; 
-        let geminiReady = false;
-        let isTransferring = false;
-        let isDisconnecting = false; 
-        let isTransferContextActive = false;
-
-        let streamSid = null;
-        let latestMediaTimestamp = 0;
-        let markQueue = [];
-        let responseStartTimestampTwilio = null;
-        let lastAssistantMark = null;
-        let callEnded = false;
-        let callTimer = null;
-        
-        let accumulatedText = '';
-        let accumulatedTranscription = '';
-        
-        let soundPumpInterval = null;  
-        let isSpeaking = false;        
-        let soundSamples = null;   
-        let soundOffset = 0;       
-        let soundVolume = 30;      
-
-        let callId = null;
-        let businessId = null;
-        let contactId = null;
-        let campaignId = null;
-        let targetNumber = null;
-        let direction = 'inbound';
-        let callStartTime = null;
-        let callerTranscriptParts = [];
-        let geminiTranscriptParts = [];
-
-        let isGroupCall = false;
-        let groupRoutingConditions = '';
-        let availableAgents = [];
-        let currentAgent = null;
-
-        let liveCallTasksPrompt = '';
-        let capturedExtractedData = null;
+        let geminiWs = null, geminiReady = false, isTransferring = false, isDisconnecting = false, isTransferContextActive = false;
+        let streamSid = null, latestMediaTimestamp = 0, markQueue = [], responseStartTimestampTwilio = null;
+        let callEnded = false, callTimer = null, accumulatedText = '', accumulatedTranscription = '';
+        let soundPumpInterval = null, isSpeaking = false, soundSamples = null, soundOffset = 0, soundVolume = 30;
+        let callId = null, businessId = null, targetNumber = null, callStartTime = null;
+        let callerTranscriptParts = [], geminiTranscriptParts = [], currentAgent = null, availableAgents = [];
+        let isGroupCall = false, groupRoutingConditions = '', liveCallTasksPrompt = '';
 
         const endCall = async (reason = 'timeout') => {
             if (callEnded) return;
-
-            if (reason === 'timeout') {
-                if (geminiWs && geminiWs.readyState === WebSocket.OPEN && geminiReady) {
-                    console.log(`[SYS] Max Call Duration Reached. Injecting timeout instruction...`);
-                    const goodbyeMsg = {
-                        client_content: {
-                            turns: [{ role: 'user', parts: [{ text: '[INTERNAL INSTRUCTION - DO NOT READ ALOUD] The maximum call time limit has been reached. End the call now naturally as an Indian caller who suddenly needs to leave. Keep it very short, casual, and human. Do not mention time limits. Append [END_CALL] at the end of your text response.' }] }],
-                            turn_complete: true
-                        }
-                    };
-                    geminiWs.send(JSON.stringify(goodbyeMsg));
-                } else {
-                    endCall('forced_timeout'); 
-                }
+            if (reason === 'timeout' && geminiWs && geminiWs.readyState === WebSocket.OPEN && geminiReady) {
+                geminiWs.send(JSON.stringify({ client_content: { turns: [{ role: 'user', parts: [{ text: '[INTERNAL INSTRUCTION] The call time limit reached. End the call naturally.' }] }], turn_complete: true } }));
                 return; 
             }
-
-            console.log(`[SYS] Physically closing call sockets. Reason: ${reason}`);
-            callEnded = true;
-            isDisconnecting = true;
-            
-            if (callTimer) { clearTimeout(callTimer); callTimer = null; }
-            
+            callEnded = true; isDisconnecting = true;
+            if (callTimer) clearTimeout(callTimer);
             stopSoundPump();
-            await saveCallToDatabase(reason);
-            
+
+            if (callId) {
+                const durationSeconds = callStartTime ? Math.floor((Date.now() - callStartTime) / 1000) : 0;
+                const minutesUsed = Math.ceil(durationSeconds / 60);
+                await updateCallRecord(callId, { 
+                    status: 'completed', durationSeconds, creditsUsed: minutesUsed,
+                    callerTranscript: callerTranscriptParts.join('\n'), geminiTranscript: geminiTranscriptParts.join('\n'),
+                    summary: await generateCallSummary(callerTranscriptParts.join('\n'), geminiTranscriptParts.join('\n'))
+                });
+                await incrementBusinessCallCount(businessId);
+                if (minutesUsed > 0) await supabase.rpc('subtract_credits', { business_id_input: businessId, amount_to_subtract: minutesUsed });
+            }
             if (connection.readyState === WebSocket.OPEN) connection.close();
             if (geminiWs && geminiWs.readyState === WebSocket.OPEN) geminiWs.close();
         };
 
-        const saveCallToDatabase = async (reason) => {
-            if (!callId) return;
-            const durationSeconds = callStartTime ? Math.floor((Date.now() - callStartTime) / 1000) : 0;
-            const callerTranscript = callerTranscriptParts.join('\n') || null;
-            const geminiTranscript = geminiTranscriptParts.join('\n') || null;
-
-            const summary = await generateCallSummary(callerTranscript, geminiTranscript);
-            const minutesUsed = Math.ceil(durationSeconds / 60);
-
-            await updateCallRecord(callId, { 
-                status: 'completed', 
-                callerTranscript, 
-                geminiTranscript, 
-                durationSeconds, 
-                summary,
-                creditsUsed: minutesUsed 
-            });
-
-            await incrementBusinessCallCount(businessId);
-
-            if (minutesUsed > 0) {
-                await supabase.rpc('subtract_credits', { 
-                    business_id_input: businessId, 
-                    amount_to_subtract: minutesUsed 
-                });
-            }
-        };
-
         const startSoundPump = () => {
             if (!soundSamples || soundPumpInterval) return;
-            const CHUNK_SIZE_8K = 160; 
-            const CHUNK_SIZE_24K = 480;
-
             soundPumpInterval = setInterval(() => {
-                if (!streamSid || callEnded || isTransferring || isDisconnecting) return;
-                if (isSpeaking) return; 
-
-                try {
-                    const chunk = new Int16Array(CHUNK_SIZE_24K);
-                    const vol = soundVolume / 100;
-
-                    for (let i = 0; i < CHUNK_SIZE_24K; i++) {
-                        chunk[i] = Math.round(soundSamples[soundOffset % soundSamples.length] * vol);
-                        soundOffset++;
-                    }
-
-                    const mulaw8k = Buffer.alloc(CHUNK_SIZE_8K);
-                    for (let i = 0; i < CHUNK_SIZE_8K; i++) {
-                        mulaw8k[i] = linearToMulaw(Math.max(-32768, Math.min(32767, chunk[i * 3])));
-                    }
-
-                    const payload = mulaw8k.toString('base64');
-                    if (connection.readyState === WebSocket.OPEN) {
-                        connection.send(JSON.stringify({ event: 'media', streamSid, media: { payload } }));
-                    }
-                } catch (err) {
-                    console.error('Sound pump error:', err.message);
-                }
+                if (!streamSid || callEnded || isTransferring || isDisconnecting || isSpeaking) return;
+                const chunk = new Int16Array(480); const vol = soundVolume / 100;
+                for (let i = 0; i < 480; i++) { chunk[i] = Math.round(soundSamples[soundOffset % soundSamples.length] * vol); soundOffset++; }
+                const mulaw8k = Buffer.alloc(160);
+                for (let i = 0; i < 160; i++) mulaw8k[i] = linearToMulaw(Math.max(-32768, Math.min(32767, chunk[i * 3])));
+                if (connection.readyState === WebSocket.OPEN) connection.send(JSON.stringify({ event: 'media', streamSid, media: { payload: mulaw8k.toString('base64') } }));
             }, 20);
         };
 
-        const stopSoundPump = () => {
-            if (soundPumpInterval) {
-                clearInterval(soundPumpInterval);
-                soundPumpInterval = null;
-            }
-        };
-
-        const handleInterruption = () => {
-            if (markQueue.length > 0 && responseStartTimestampTwilio != null) {
-                connection.send(JSON.stringify({ event: 'clear', streamSid }));
-                markQueue = [];
-                lastAssistantMark = null;
-                responseStartTimestampTwilio = null;
-            }
-        };
-
-        const sendMark = () => {
-            if (streamSid) {
-                connection.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: 'responsePart' } }));
-                markQueue.push('responsePart');
-                lastAssistantMark = 'responsePart';
-            }
-        };
-
-        const executeHotSwap = (targetId) => {
-            const targetAgent = availableAgents.find(a => String(a.id).trim() === targetId.trim());
-            
-            if (!targetAgent) {
-                console.error(`[HOT SWAP FAIL] Invalid Target ID: ${targetId}. Continuing with current agent.`);
-                isTransferring = false;
-                return;
-            }
-            if (targetAgent.id === currentAgent.id) {
-                console.log(`[SYS] AI attempted to transfer to itself. Ignoring.`);
-                isTransferring = false;
-                return;
-            }
-
-            console.log(`[HOT SWAP] Instantly swapping from ${currentAgent.name} to ${targetAgent.name}`);
-
-            if (geminiWs && geminiWs.readyState === WebSocket.OPEN) {
-                geminiWs.close();
-            }
-
-            isSpeaking = false;
-            markQueue = [];
-            accumulatedText = '';
-            accumulatedTranscription = '';
-            currentAgent = targetAgent;
-
-            if (targetAgent.background_sound && targetAgent.background_sound !== 'none') {
-                soundVolume = targetAgent.sound_volume ?? 30;
-                loadSoundPCM(targetAgent.background_sound).then(s => {
-                    soundSamples = s;
-                    startSoundPump();
-                });
-            } else {
-                stopSoundPump();
-                soundSamples = null;
-            }
-
-            const history = callerTranscriptParts.slice(-10).join('\n') || "No previous context.";
-            connectGemini(history);
-        };
+        const stopSoundPump = () => { if (soundPumpInterval) { clearInterval(soundPumpInterval); soundPumpInterval = null; } };
+        const sendMark = () => { if (streamSid) { connection.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: 'responsePart' } })); markQueue.push('responsePart'); } };
 
         const connectGemini = (transferContext = null) => {
-            geminiReady = false;
-            geminiWs = new WebSocket(GEMINI_WS_URL);
-
-            geminiWs.on('error', (err) => console.error("Gemini WebSocket Error:", err));
-
+            geminiReady = false; geminiWs = new WebSocket(GEMINI_WS_URL);
             geminiWs.on('open', () => {
                 let finalPrompt = currentAgent ? currentAgent.prompt : SYSTEM_MESSAGE;
-                let finalVoice = currentAgent ? currentAgent.voice : VOICE;
-
-                if (isGroupCall && availableAgents.length > 0) {
-                    finalPrompt += `\n\n=== MULTI-AGENT ROUTING RULES ===\n${groupRoutingConditions}\n\nIMPORTANT INSTRUCTION: If the user's request matches your routing rules, you MUST transfer the call. To do this, simply say a brief transition sentence (e.g., "I'll transfer you now, please hold.") and append EXACTLY this tag at the very end of your text response: [TRANSFER_TO_agent_id]\n\nAVAILABLE AGENTS & EXACT TAGS TO USE:\n`;
-                    availableAgents.forEach(a => {
-                        finalPrompt += `- To transfer to ${a.name}, use tag: [TRANSFER_TO_${a.id}]\n`;
-                    });
-                }
-
-                finalPrompt += `\n\nAdditionally follow these natural conversation rules:\n- Use natural fillers: "hmm...", "uh...", "okay..."\n- Keep responses VERY SHORT — 1-2 sentences max\n- If user is silent: "hello... are you there?"\n- If user wants to end call: say a warm goodbye and append [END_CALL] at the very end of your text response\n- The [END_CALL] tag is never spoken — it is only a signal`;
-                
-                if (liveCallTasksPrompt) {
-                    finalPrompt += `\n\n=== SPECIAL USER-DEFINED LIVE ACTIONS ===\nYou must strictly fulfill these tasks during the call:\n${liveCallTasksPrompt}\n\nIf you successfully extract or satisfy the target information requested above (such as an email address, name, or appointment confirmation), you must cleanly append a structured data tag to your text response exactly like this example format: [EXTRACTED_DATA: email=user@domain.com, name=John]\nDo not read this bracket data block out loud to the caller.`;
-                }
-
-                const setupMsg = {
-                    setup: {
-                        model: `models/${MODEL}`,
-                        generation_config: {
-                            response_modalities: ['AUDIO'],
-                            speech_config: { voice_config: { prebuilt_voice_config: { voice_name: finalVoice } } }
-                        },
-                        input_audio_transcription: {},
-                        output_audio_transcription: {},
-                        system_instruction: { parts: [{ text: finalPrompt }] }
-                    }
-                };
-
-                if (transferContext) {
-                    isTransferContextActive = true;
-                }
-
-                geminiWs.send(JSON.stringify(setupMsg));
+                if (liveCallTasksPrompt) finalPrompt += `\n[TASKS]: ${liveCallTasksPrompt}`;
+                geminiWs.send(JSON.stringify({ setup: { model: `models/${MODEL}`, generation_config: { response_modalities: ['AUDIO'], speech_config: { voice_config: { prebuilt_voice_config: { voice_name: currentAgent?.voice || VOICE } } } }, system_instruction: { parts: [{ text: finalPrompt }] } } }));
+                if (transferContext) isTransferContextActive = true;
             });
 
             geminiWs.on('message', (data) => {
-                try {
-                    const msg = JSON.parse(data.toString());
-
-                    if (msg.setupComplete !== undefined) {
-                        geminiReady = true;
-                        isTransferring = false;
-                        
-                        if (isTransferContextActive) {
-                            const transferMsg = {
-                                client_content: {
-                                    turns: [{ role: 'user', parts: [{ text: `[INTERNAL SYSTEM MESSAGE] You just received a transferred phone call. Here is the recent conversation transcript:\n\n${transferContext}\n\nAcknowledge the transfer naturally based on your persona and continue the conversation out loud.` }] }],
-                                    turn_complete: true
-                                }
-                            };
-                            geminiWs.send(JSON.stringify(transferMsg));
-                            isTransferContextActive = false;
-                        } else {
-                            geminiWs.send(JSON.stringify({
-                                client_content: { turns: [{ role: 'user', parts: [{ text: 'Greet the user with a short, friendly welcome message and ask how you can help.' }] }], turn_complete: true }
-                            }));
-                        }
-                        return;
+                const msg = JSON.parse(data.toString());
+                if (msg.setupComplete !== undefined) {
+                    geminiReady = true; isTransferring = false;
+                    geminiWs.send(JSON.stringify({ client_content: { turns: [{ role: 'user', parts: [{ text: isTransferContextActive ? 'Acknowledge transfer and continue.' : 'Greet the user.' }] }], turn_complete: true } }));
+                    isTransferContextActive = false; return;
+                }
+                if (msg.serverContent) {
+                    const sc = msg.serverContent;
+                    if (sc.interrupted) { if (markQueue.length > 0) connection.send(JSON.stringify({ event: 'clear', streamSid })); markQueue = []; }
+                    if (sc.inputTranscription?.text) callerTranscriptParts.push(`Caller: ${sc.inputTranscription.text}`);
+                    if (sc.outputTranscription?.text) {
+                        accumulatedTranscription += sc.outputTranscription.text; geminiTranscriptParts.push(`AI: ${sc.outputTranscription.text}`);
+                        if (accumulatedTranscription.includes('[END_CALL]') && !isDisconnecting) { isDisconnecting = true; setTimeout(() => endCall('user_intent'), 1500); }
                     }
-
-                    if (msg.serverContent) {
-                        const sc = msg.serverContent;
-
-                        if (sc.interrupted && !isTransferring && !isDisconnecting) {
-                            handleInterruption();
-                            return;
-                        }
-
-                        if (sc.inputTranscription?.text) {
-                            callerTranscriptParts.push(`Caller: ${sc.inputTranscription.text}`);
-                        }
-
-                        if (sc.outputTranscription?.text) {
-                            const incomingText = sc.outputTranscription.text;
-                            accumulatedTranscription += incomingText;
-                            geminiTranscriptParts.push(`AI (${currentAgent?.name || 'System'}): ${incomingText}`);
-
-                            const dataMatch = accumulatedTranscription.match(/\[EXTRACTED_DATA:\s*([^\]]+)\]/i);
-                            if (dataMatch) {
-                                capturedExtractedData = dataMatch[1].trim();
-                                console.log(`[SYS] Target Captured (Transcription): ${capturedExtractedData}`);
-                            }
-
-                            if (accumulatedTranscription.includes('[END_CALL]') && !isDisconnecting) {
-                                console.log(`[SYS] Caught END_CALL Tag in transcription. Initiating socket disconnect in 1.5s...`);
-                                isDisconnecting = true;
-                                setTimeout(() => { endCall('user_intent'); }, 1500); 
-                            }
-
-                            const tagMatch = accumulatedTranscription.match(/\[TRANSFER_TO_([a-zA-Z0-9-]+)\]/);
-                            if (tagMatch && !isTransferring) {
-                                isTransferring = true;
-                                const targetId = tagMatch[1];
-                                console.log(`[SYS] Caught TRANSFER_TO tag for ID: ${targetId} in transcription. Triggering swap in 1.5s...`);
-                                setTimeout(() => { executeHotSwap(targetId); }, 1500);
-                            }
-                        }
-
-                        if (sc.modelTurn?.parts) {
-                            for (const part of sc.modelTurn.parts) {
-
-                                if (part.text) {
-                                    accumulatedText += part.text;
-
-                                    const dataMatchText = accumulatedText.match(/\[EXTRACTED_DATA:\s*([^\]]+)\]/i);
-                                    if (dataMatchText) {
-                                        capturedExtractedData = dataMatchText[1].trim();
-                                        console.log(`[SYS] Target Captured (Text): ${capturedExtractedData}`);
-                                    }
-                                    
-                                    if (accumulatedText.includes('[END_CALL]') && !isDisconnecting) {
-                                        console.log(`[SYS] Caught END_CALL Tag in text parts. Initiating socket disconnect in 1.5s...`);
-                                        isDisconnecting = true;
-                                        setTimeout(() => { endCall('user_intent'); }, 1500); 
-                                    }
-
-                                    const tagMatch = accumulatedText.match(/\[TRANSFER_TO_([a-zA-Z0-9-]+)\]/);
-                                    if (tagMatch && !isTransferring) {
-                                        isTransferring = true;
-                                        const targetId = tagMatch[1];
-                                        console.log(`[SYS] Caught TRANSFER_TO tag for ID: ${targetId} in text parts. Triggering swap in 1.5s...`);
-                                        setTimeout(() => { executeHotSwap(targetId); }, 1500);
-                                    }
+                    if (sc.modelTurn?.parts) {
+                        for (const part of sc.modelTurn.parts) {
+                            if (part.inlineData?.data) {
+                                isSpeaking = true;
+                                let audioBase64 = part.inlineData.data;
+                                if (soundSamples) {
+                                    const pcmBuf = Buffer.from(audioBase64, 'base64');
+                                    const { mixed, newOffset } = mixSoundIntoAudio(new Int16Array(pcmBuf.buffer, pcmBuf.byteOffset, pcmBuf.byteLength / 2), soundSamples, soundOffset, soundVolume);
+                                    soundOffset = newOffset; audioBase64 = Buffer.from(mixed.buffer).toString('base64');
                                 }
-
-                                if (part.inlineData?.data) {
-                                    const mimeType = part.inlineData.mimeType || '';
-                                    if (mimeType.startsWith('audio/pcm') || mimeType === 'audio/pcm;rate=24000') {
-                                        isSpeaking = true;
-                                        let audioBase64 = part.inlineData.data;
-
-                                        if (soundSamples && soundSamples.length > 0) {
-                                            try {
-                                                const pcmBuf = Buffer.from(audioBase64, 'base64');
-                                                const geminiPcm = new Int16Array(pcmBuf.buffer, pcmBuf.byteOffset, pcmBuf.byteLength / 2);
-                                                const { mixed, newOffset } = mixSoundIntoAudio(geminiPcm, soundSamples, soundOffset, soundVolume);
-                                                soundOffset = newOffset;
-                                                audioBase64 = Buffer.from(mixed.buffer).toString('base64');
-                                            } catch (mixErr) {
-                                                console.error('Sound mixing error:', mixErr.message);
-                                            }
-                                        }
-
-                                        const mulawPayload = pcm16Base64ToMulawBase64(audioBase64);
-                                        connection.send(JSON.stringify({ event: 'media', streamSid, media: { payload: mulawPayload } }));
-
-                                        if (!responseStartTimestampTwilio) responseStartTimestampTwilio = latestMediaTimestamp;
-                                        sendMark();
-                                    }
-                                }
-                            }
-                        }
-
-                        if (sc.turnComplete) {
-                            isSpeaking = false;
-                            if (!isTransferring && !isDisconnecting) {
-                                accumulatedText = ''; 
-                                accumulatedTranscription = '';
+                                connection.send(JSON.stringify({ event: 'media', streamSid, media: { payload: pcm16Base64ToMulawBase64(audioBase64) } }));
+                                sendMark();
                             }
                         }
                     }
-                } catch (err) {
-                    console.error('Error processing Gemini message:', err);
+                    if (sc.turnComplete) { isSpeaking = false; accumulatedTranscription = ''; }
                 }
             });
         };
 
         connection.on('message', async (message) => {
-            try {
-                const data = JSON.parse(message);
+            const data = JSON.parse(message);
+            if (data.event === 'start') {
+                streamSid = data.start.streamSid; callStartTime = Date.now();
+                const params = data.start.customParameters || {};
+                businessId = params.businessId; targetNumber = params.targetNumber;
 
-                switch (data.event) {
-                    case 'start':
-                        streamSid = data.start.streamSid;
-                        callStartTime = Date.now();
-
-                        const params = data.start.customParameters || {};
-                        businessId = params.businessId || null;
-                        contactId = params.contactId || null;
-                        direction = params.direction || 'inbound';
-                        const agentId = params.agentId || null;
-                        const groupId = params.groupId || null;
-                        
-                        campaignId = params.campaignId;
-                        if (!campaignId || campaignId === 'null' || campaignId === 'undefined') {
-                            campaignId = null;
-                        }
-                        
-                        targetNumber = params.targetNumber;
-                        if (!targetNumber || targetNumber === 'null' || targetNumber === 'undefined') {
-                            targetNumber = null;
-                        }
-
-                        const maxDurationSec = parseInt(params.maxDuration || '120', 10);
-
-                        if (businessId) {
-                            const activeSettings = await getActiveCallSettings(businessId, campaignId);
-                            if (activeSettings) {
-                                liveCallTasksPrompt = activeSettings.liveCallTasksPrompt;
-                            }
-                        }
-
-                        if (groupId) {
-                            isGroupCall = true;
-                            const groupData = await getGroupById(groupId);
-                            
-                            if (groupData) {
-                                groupRoutingConditions = groupData.routing_conditions;
-                                
-                                const pAgent = await getAgentById(groupData.primary_agent_id);
-                                if (pAgent) {
-                                    currentAgent = pAgent;
-                                    availableAgents.push(pAgent);
-                                }
-                                
-                                for (const member of (groupData.group_members || [])) {
-                                    if (member.agent_id !== groupData.primary_agent_id) {
-                                        const bAgent = await getAgentById(member.agent_id);
-                                        if (bAgent) availableAgents.push(bAgent);
-                                    }
-                                }
-                            }
-                        } else if (agentId) {
-                            currentAgent = await getAgentById(agentId);
-                        }
-
-                        if (currentAgent && currentAgent.background_sound && currentAgent.background_sound !== 'none') {
-                            soundVolume = currentAgent.sound_volume ?? 30;
-                            const sSamples = await loadSoundPCM(currentAgent.background_sound);
-                            if (sSamples) {
-                                soundSamples = sSamples;
-                                startSoundPump();
-                            }
-                        }
-
-                        connectGemini();
-
-                        callId = await createCallRecord({ 
-                            businessId, 
-                            contactId,
-                            campaignId,
-                            targetNumber,
-                            direction, 
-                            twilioCallSid: streamSid,
-                            maxDurationLimit: maxDurationSec 
-                        });
-                        
-                        responseStartTimestampTwilio = null;
-                        latestMediaTimestamp = 0;
-
-                        callTimer = setTimeout(() => {
-                            endCall('timeout');
-                        }, maxDurationSec * 1000);
-                        break;
-
-                    case 'media':
-                        latestMediaTimestamp = data.media.timestamp;
-                        if (geminiWs && geminiWs.readyState === WebSocket.OPEN && geminiReady && !isTransferring && !isDisconnecting) {
-                            const pcm16Payload = mulawBase64ToPcm16Base64(data.media.payload);
-                            geminiWs.send(JSON.stringify({
-                                realtime_input: { media_chunks: [{ data: pcm16Payload, mime_type: 'audio/pcm;rate=16000' }] }
-                            }));
-                        }
-                        break;
-
-                    case 'mark':
-                        if (markQueue.length > 0) markQueue.shift();
-                        break;
-
-                    case 'stop':
-                        endCall('caller_hung_up');
-                        break;
+                // Sync with existing record safely
+                const { data: existingRecord } = await supabase.from('calls').select('id').eq('twilio_call_sid', streamSid).maybeSingle();
+                if (existingRecord) {
+                    callId = existingRecord.id;
+                    await supabase.from('calls').update({ status: 'in-progress' }).eq('id', callId);
                 }
-            } catch (err) {
-                console.error('Error parsing Twilio message:', err);
-            }
-        });
+                
+                if (params.agentId) currentAgent = await getAgentById(params.agentId);
+                if (currentAgent?.background_sound) { soundVolume = currentAgent.sound_volume ?? 30; soundSamples = await loadSoundPCM(currentAgent.background_sound); startSoundPump(); }
 
-        connection.on('close', () => {
-            stopSoundPump();
-            endCall('connection_closed');
+                connectGemini();
+                callTimer = setTimeout(() => endCall('timeout'), parseInt(params.maxDuration || '120') * 1000);
+            }
+            if (data.event === 'media' && geminiReady && !isDisconnecting) {
+                geminiWs.send(JSON.stringify({ realtime_input: { media_chunks: [{ data: mulawBase64ToPcm16Base64(data.media.payload), mime_type: 'audio/pcm;rate=16000' }] } }));
+            }
+            if (data.event === 'mark') markQueue.shift();
+            if (data.event === 'stop') endCall('caller_hung_up');
         });
+        connection.on('close', () => endCall('connection_closed'));
     });
 });
 
-// --- RAZORPAY PAYMENT VERIFICATION ---
 fastify.post('/verify-payment', async (request, reply) => {
-    const { paymentId, businessId, creditsToAdd } = request.body;
-
-    if (!paymentId || !businessId || !creditsToAdd) {
-        return reply.status(400).send({ success: false, error: 'Missing required fields' });
-    }
-
     try {
+        const { paymentId, businessId, creditsToAdd } = request.body;
         const credentials = Buffer.from(`${process.env.RAZORPAY_KEY_ID}:${process.env.RAZORPAY_KEY_SECRET}`).toString('base64');
-        const response = await fetch(`https://api.razorpay.com/v1/payments/${paymentId}`, {
-            headers: { 'Authorization': `Basic ${credentials}` }
-        });
+        const response = await fetch(`https://api.razorpay.com/v1/payments/${paymentId}`, { headers: { 'Authorization': `Basic ${credentials}` } });
         const rzpData = await response.json();
-
         if (rzpData.status === 'captured' || rzpData.status === 'authorized') {
-            const { error } = await supabase.rpc('add_credits', {
-                business_id_input: businessId,
-                amount_to_add: creditsToAdd
-            });
-
-            if (error) throw error;
-            return reply.send({ success: true, message: 'Payment verified and credits added.' });
-        } else {
-            return reply.status(400).send({ success: false, error: 'Payment not captured by Razorpay.' });
+            await supabase.rpc('add_credits', { business_id_input: businessId, amount_to_add: creditsToAdd });
+            return reply.send({ success: true });
         }
-    } catch (err) {
-        console.error('Payment Verification Error:', err);
-        return reply.status(500).send({ success: false, error: err.message });
-    }
+        reply.status(400).send({ success: false });
+    } catch (err) { reply.status(500).send({ success: false }); }
 });
 
 fastify.listen({ port: PORT, host: '0.0.0.0' }, (err) => {
