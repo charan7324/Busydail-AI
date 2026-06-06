@@ -17,7 +17,9 @@ const {
 if (!GEMINI_API_KEY) { console.error('Missing GEMINI_API_KEY'); process.exit(1); }
 if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) { console.error('Missing Supabase credentials'); process.exit(1); }
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
+    auth: { persistSession: false }
+});
 
 const fastify = Fastify();
 fastify.register(fastifyFormBody);
@@ -214,9 +216,9 @@ async function createCallRecord({ businessId, contactId, campaignId, targetNumbe
             started_at: new Date().toISOString()
         })
         .select()
-        .single();
+        .maybeSingle();
     if (error) { console.error('Error creating call record:', error.message); return null; }
-    return data.id;
+    return data ? data.id : null;
 }
 
 async function updateCallRecord(callId, { status, callerTranscript, geminiTranscript, durationSeconds, summary, creditsUsed }) {
@@ -244,7 +246,7 @@ async function incrementBusinessCallCount(businessId) {
 
 async function getAgentById(agentId) {
     if (!agentId) return null;
-    const { data, error } = await supabase.from('agents').select('*').eq('id', agentId).single();
+    const { data, error } = await supabase.from('agents').select('*').eq('id', agentId).maybeSingle();
     if (error) return null;
     return data;
 }
@@ -255,7 +257,7 @@ async function getGroupById(groupId) {
         .from('ai_groups')
         .select(`id, name, routing_conditions, primary_agent_id, group_members(agent_id)`)
         .eq('id', groupId)
-        .single();
+        .maybeSingle();
     if (error) return null;
     return data;
 }
@@ -266,7 +268,7 @@ async function getActiveCallSettings(businessId, campaignId) {
         .from('businesses')
         .select('live_call_tasks_prompt')
         .eq('id', businessId)
-        .single();
+        .maybeSingle();
 
     if (error || !biz) return null;
     return { liveCallTasksPrompt: biz.live_call_tasks_prompt || '' };
@@ -310,7 +312,7 @@ fastify.post('/call-status', async (request, reply) => {
         .from('calls')
         .select('id, status')
         .eq('twilio_call_sid', CallSid)
-        .single();
+        .maybeSingle();
 
     if (existingCall) {
         // If row exists, update it to the terminal Twilio status
@@ -375,7 +377,7 @@ fastify.post('/make-call', async (request, reply) => {
         .from('businesses')
         .select('twilio_account_sid, twilio_auth_token, twilio_number, credits_balance')
         .eq('id', businessId)
-        .single();
+        .maybeSingle();
 
     if (dbError || !businessData) {
         return reply.status(500).send({ error: 'Failed to retrieve business profile.' });
@@ -907,7 +909,7 @@ fastify.register(async (fastify) => {
                         connectGemini();
 
                         // Link the websocket to the row we already created
-                        const { data: existingRecord } = await supabase.from('calls').select('id').eq('twilio_call_sid', streamSid).single();
+                        const { data: existingRecord } = await supabase.from('calls').select('id').eq('twilio_call_sid', streamSid).maybeSingle();
                         if (existingRecord) {
                             callId = existingRecord.id;
                             await supabase.from('calls').update({ status: 'in-progress' }).eq('id', callId);
