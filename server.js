@@ -313,15 +313,17 @@ fastify.post('/call-status', async (request, reply) => {
         .single();
 
     if (existingCall) {
-        if (CallStatus !== 'in-progress' && CallStatus !== 'ringing' && CallStatus !== 'initiated' && CallStatus !== 'queued') {
+        // If row exists, update it to the terminal Twilio status
+        if (['busy', 'no-answer', 'canceled', 'failed', 'completed'].includes(CallStatus)) {
             await supabase.from('calls').update({ 
                 status: CallStatus,
                 ended_at: new Date().toISOString()
             }).eq('id', existingCall.id);
         }
     } else {
-        if (CallStatus === 'busy' || CallStatus === 'no-answer' || CallStatus === 'canceled' || CallStatus === 'failed' || CallStatus === 'completed') {
-            console.log(`[SYS] Logging connection drop for ${targetNumber} as: ${CallStatus}`);
+        // Failsafe: if the initial DB insertion failed, catch it here.
+        if (['busy', 'no-answer', 'canceled', 'failed', 'completed'].includes(CallStatus)) {
+            console.log(`[SYS] Logging connection drop fallback for ${targetNumber} as: ${CallStatus}`);
             
             let cId = campaignId;
             if (!cId || cId === 'null' || cId === 'undefined') cId = null;
@@ -431,6 +433,23 @@ fastify.post('/make-call', async (request, reply) => {
 
         const data = await response.json();
         if (data.sid) {
+            let cId = campaignId;
+            if (!cId || cId === 'null' || cId === 'undefined') cId = null;
+
+            // --- INSTANT ROW CREATION ---
+            await supabase.from('calls').insert({
+                business_id: businessId || null,
+                contact_id: contactId || null,
+                campaign_id: cId,
+                target_number: to,
+                direction: 'outbound',
+                status: 'initiated', 
+                twilio_call_sid: data.sid,
+                duration_seconds: 0,
+                credits_used: 0,
+                started_at: new Date().toISOString()
+            });
+
             reply.send({ success: true, callSid: data.sid, to });
         } else {
             reply.status(500).send({ success: false, error: data.message || 'Failed to initiate call via your Twilio account' });
@@ -887,15 +906,17 @@ fastify.register(async (fastify) => {
 
                         connectGemini();
 
-                        callId = await createCallRecord({ 
-                            businessId, 
-                            contactId,
-                            campaignId,
-                            targetNumber,
-                            direction, 
-                            twilioCallSid: streamSid,
-                            maxDurationLimit: maxDurationSec 
-                        });
+                        // Link the websocket to the row we already created
+                        const { data: existingRecord } = await supabase.from('calls').select('id').eq('twilio_call_sid', streamSid).single();
+                        if (existingRecord) {
+                            callId = existingRecord.id;
+                            await supabase.from('calls').update({ status: 'in-progress' }).eq('id', callId);
+                        } else {
+                            callId = await createCallRecord({ 
+                                businessId, contactId, campaignId, targetNumber,
+                                direction, twilioCallSid: streamSid, maxDurationLimit: maxDurationSec 
+                            });
+                        }
                         
                         responseStartTimestampTwilio = null;
                         latestMediaTimestamp = 0;
