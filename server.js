@@ -17,9 +17,7 @@ const {
 if (!GEMINI_API_KEY) { console.error('Missing GEMINI_API_KEY'); process.exit(1); }
 if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) { console.error('Missing Supabase credentials'); process.exit(1); }
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
-    auth: { persistSession: false }
-});
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 
 const fastify = Fastify();
 fastify.register(fastifyFormBody);
@@ -216,9 +214,9 @@ async function createCallRecord({ businessId, contactId, campaignId, targetNumbe
             started_at: new Date().toISOString()
         })
         .select()
-        .maybeSingle();
+        .limit(1);
     if (error) { console.error('Error creating call record:', error.message); return null; }
-    return data ? data.id : null;
+    return data && data.length > 0 ? data[0].id : null;
 }
 
 async function updateCallRecord(callId, { status, callerTranscript, geminiTranscript, durationSeconds, summary, creditsUsed }) {
@@ -246,9 +244,9 @@ async function incrementBusinessCallCount(businessId) {
 
 async function getAgentById(agentId) {
     if (!agentId) return null;
-    const { data, error } = await supabase.from('agents').select('*').eq('id', agentId).maybeSingle();
+    const { data, error } = await supabase.from('agents').select('*').eq('id', agentId).limit(1);
     if (error) return null;
-    return data;
+    return data && data.length > 0 ? data[0] : null;
 }
 
 async function getGroupById(groupId) {
@@ -257,9 +255,9 @@ async function getGroupById(groupId) {
         .from('ai_groups')
         .select(`id, name, routing_conditions, primary_agent_id, group_members(agent_id)`)
         .eq('id', groupId)
-        .maybeSingle();
+        .limit(1);
     if (error) return null;
-    return data;
+    return data && data.length > 0 ? data[0] : null;
 }
 
 async function getActiveCallSettings(businessId, campaignId) {
@@ -268,10 +266,10 @@ async function getActiveCallSettings(businessId, campaignId) {
         .from('businesses')
         .select('live_call_tasks_prompt')
         .eq('id', businessId)
-        .maybeSingle();
+        .limit(1);
 
-    if (error || !biz) return null;
-    return { liveCallTasksPrompt: biz.live_call_tasks_prompt || '' };
+    if (error || !biz || biz.length === 0) return null;
+    return { liveCallTasksPrompt: biz[0].live_call_tasks_prompt || '' };
 }
 
 async function generateCallSummary(callerTranscript, geminiTranscript) {
@@ -303,27 +301,28 @@ fastify.get('/', async (request, reply) => {
 
 // --- GLOBAL CALL STATUS CALLBACK WEBHOOK ---
 fastify.post('/call-status', async (request, reply) => {
-    const { CallSid, CallStatus } = request.body;
+    const { CallSid, CallStatus, CallDuration } = request.body;
     const { businessId, campaignId, targetNumber, contactId } = request.query;
 
     console.log(`[TWILIO STATUS PING] Call ${CallSid} received status: ${CallStatus}`);
 
+    // Prevent Race Conditions: Find record using robust Limit(1)
     const { data: existingCall } = await supabase
         .from('calls')
         .select('id, status')
         .eq('twilio_call_sid', CallSid)
-        .maybeSingle();
+        .limit(1);
 
-    if (existingCall) {
-        // If row exists, update it to the terminal Twilio status
-        if (['busy', 'no-answer', 'canceled', 'failed', 'completed'].includes(CallStatus)) {
-            await supabase.from('calls').update({ 
-                status: CallStatus,
-                ended_at: new Date().toISOString()
-            }).eq('id', existingCall.id);
+    if (existingCall && existingCall.length > 0) {
+        // Safe Update
+        let updateData = { status: CallStatus, ended_at: new Date().toISOString() };
+        if (CallDuration) {
+            updateData.duration_seconds = parseInt(CallDuration, 10);
+            updateData.credits_used = Math.ceil(updateData.duration_seconds / 60);
         }
+        await supabase.from('calls').update(updateData).eq('id', existingCall[0].id);
     } else {
-        // Failsafe: if the initial DB insertion failed, catch it here.
+        // Failsafe Insert
         if (['busy', 'no-answer', 'canceled', 'failed', 'completed'].includes(CallStatus)) {
             console.log(`[SYS] Logging connection drop fallback for ${targetNumber} as: ${CallStatus}`);
             
@@ -338,8 +337,8 @@ fastify.post('/call-status', async (request, reply) => {
                 direction: 'outbound',
                 status: CallStatus, 
                 twilio_call_sid: CallSid,
-                duration_seconds: 0,
-                credits_used: 0,
+                duration_seconds: CallDuration ? parseInt(CallDuration, 10) : 0,
+                credits_used: CallDuration ? Math.ceil(parseInt(CallDuration, 10) / 60) : 0,
                 started_at: new Date().toISOString(),
                 ended_at: new Date().toISOString()
             });
@@ -377,23 +376,25 @@ fastify.post('/make-call', async (request, reply) => {
         .from('businesses')
         .select('twilio_account_sid, twilio_auth_token, twilio_number, credits_balance')
         .eq('id', businessId)
-        .maybeSingle();
+        .limit(1);
 
-    if (dbError || !businessData) {
+    if (dbError || !businessData || businessData.length === 0) {
         return reply.status(500).send({ error: 'Failed to retrieve business profile.' });
     }
+    
+    const bData = businessData[0];
 
-    if (businessData.credits_balance <= 0) {
+    if (bData.credits_balance <= 0) {
         return reply.status(402).send({ error: 'Insufficient credits. Please top up your balance.' });
     }
 
-    if (!businessData.twilio_account_sid || !businessData.twilio_auth_token || !businessData.twilio_number) {
+    if (!bData.twilio_account_sid || !bData.twilio_auth_token || !bData.twilio_number) {
         return reply.status(400).send({ error: 'Twilio credentials not configured. Please update your Settings.' });
     }
 
-    const userTwilioSid = businessData.twilio_account_sid.trim();
-    const userTwilioAuth = businessData.twilio_auth_token.trim();
-    const userTwilioNumber = businessData.twilio_number.trim();
+    const userTwilioSid = bData.twilio_account_sid.trim();
+    const userTwilioAuth = bData.twilio_auth_token.trim();
+    const userTwilioNumber = bData.twilio_number.trim();
 
     try {
         const credentials = Buffer.from(`${userTwilioSid}:${userTwilioAuth}`).toString('base64');
@@ -438,19 +439,23 @@ fastify.post('/make-call', async (request, reply) => {
             let cId = campaignId;
             if (!cId || cId === 'null' || cId === 'undefined') cId = null;
 
-            // --- INSTANT ROW CREATION ---
-            await supabase.from('calls').insert({
-                business_id: businessId || null,
-                contact_id: contactId || null,
-                campaign_id: cId,
-                target_number: to,
-                direction: 'outbound',
-                status: 'initiated', 
-                twilio_call_sid: data.sid,
-                duration_seconds: 0,
-                credits_used: 0,
-                started_at: new Date().toISOString()
-            });
+            // --- INSTANT ROW CREATION (RACE CONDITION SHIELDED) ---
+            const { data: duplicateCheck } = await supabase.from('calls').select('id').eq('twilio_call_sid', data.sid).limit(1);
+            
+            if (!duplicateCheck || duplicateCheck.length === 0) {
+                await supabase.from('calls').insert({
+                    business_id: businessId || null,
+                    contact_id: contactId || null,
+                    campaign_id: cId,
+                    target_number: to,
+                    direction: 'outbound',
+                    status: 'initiated', 
+                    twilio_call_sid: data.sid,
+                    duration_seconds: 0,
+                    credits_used: 0,
+                    started_at: new Date().toISOString()
+                });
+            }
 
             reply.send({ success: true, callSid: data.sid, to });
         } else {
@@ -909,9 +914,9 @@ fastify.register(async (fastify) => {
                         connectGemini();
 
                         // Link the websocket to the row we already created
-                        const { data: existingRecord } = await supabase.from('calls').select('id').eq('twilio_call_sid', streamSid).maybeSingle();
-                        if (existingRecord) {
-                            callId = existingRecord.id;
+                        const { data: existingRecord } = await supabase.from('calls').select('id').eq('twilio_call_sid', streamSid).limit(1);
+                        if (existingRecord && existingRecord.length > 0) {
+                            callId = existingRecord[0].id;
                             await supabase.from('calls').update({ status: 'in-progress' }).eq('id', callId);
                         } else {
                             callId = await createCallRecord({ 
