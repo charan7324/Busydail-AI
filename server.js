@@ -91,18 +91,28 @@ const BACKGROUND_SOUND_URLS = {
 const soundCache = {};
 
 function mulawToLinear(u) {
-    u = ~u & 0xFF; let sign = u & 0x80; let exponent = (u >> 4) & 0x07; let mantissa = u & 0x0F;
-    let sample = ((mantissa << 1) + 33) << exponent; sample -= 33; return sign ? -sample : sample;
+    u = ~u & 0xFF;
+    let sign = u & 0x80;
+    let exponent = (u >> 4) & 0x07;
+    let mantissa = u & 0x0F;
+    let sample = ((mantissa << 1) + 33) << exponent;
+    sample -= 33;
+    return sign ? -sample : sample;
 }
 
 function linearToMulaw(sample) {
-    const MULAW_MAX = 0x1FFF; const MULAW_BIAS = 33;
+    const MULAW_MAX = 0x1FFF;
+    const MULAW_BIAS = 33;
     const exp_lut = [0,1,2,2,3,3,3,3,4,4,4,4,4,4,4,4,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,5,
                      6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,
                      7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,
                      7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7];
-    let sign = (sample >> 8) & 0x80; if (sign) sample = -sample; if (sample > MULAW_MAX) sample = MULAW_MAX;
-    sample += MULAW_BIAS; let exponent = exp_lut[(sample >> 7) & 0xFF]; let mantissa = (sample >> (exponent + 3)) & 0x0F;
+    let sign = (sample >> 8) & 0x80;
+    if (sign) sample = -sample;
+    if (sample > MULAW_MAX) sample = MULAW_MAX;
+    sample += MULAW_BIAS;
+    let exponent = exp_lut[(sample >> 7) & 0xFF];
+    let mantissa = (sample >> (exponent + 3)) & 0x0F;
     return ~(sign | (exponent << 4) | mantissa) & 0xFF;
 }
 
@@ -200,15 +210,15 @@ async function createCallRecord({ businessId, contactId, campaignId, targetNumbe
             campaign_id: campaignId || null,
             target_number: targetNumber || null,
             direction,
-            status: 'initiated', // Ensure it starts active
+            status: 'in-progress',
             twilio_call_sid: twilioCallSid || null,
             max_duration_limit: maxDurationLimit || 120,
             started_at: new Date().toISOString()
         })
         .select()
-        .limit(1);
+        .maybeSingle();
     if (error) { console.error('Error creating call record:', error.message); return null; }
-    return data && data.length > 0 ? data[0].id : null;
+    return data ? data.id : null;
 }
 
 async function updateCallRecord(callId, { status, callerTranscript, geminiTranscript, durationSeconds, summary, creditsUsed }) {
@@ -236,9 +246,9 @@ async function incrementBusinessCallCount(businessId) {
 
 async function getAgentById(agentId) {
     if (!agentId) return null;
-    const { data, error } = await supabase.from('agents').select('*').eq('id', agentId).limit(1);
+    const { data, error } = await supabase.from('agents').select('*').eq('id', agentId).maybeSingle();
     if (error) return null;
-    return data && data.length > 0 ? data[0] : null;
+    return data;
 }
 
 async function getGroupById(groupId) {
@@ -247,9 +257,9 @@ async function getGroupById(groupId) {
         .from('ai_groups')
         .select(`id, name, routing_conditions, primary_agent_id, group_members(agent_id)`)
         .eq('id', groupId)
-        .limit(1);
+        .maybeSingle();
     if (error) return null;
-    return data && data.length > 0 ? data[0] : null;
+    return data;
 }
 
 async function getActiveCallSettings(businessId, campaignId) {
@@ -258,10 +268,10 @@ async function getActiveCallSettings(businessId, campaignId) {
         .from('businesses')
         .select('live_call_tasks_prompt')
         .eq('id', businessId)
-        .limit(1);
+        .maybeSingle();
 
-    if (error || !biz || biz.length === 0) return null;
-    return { liveCallTasksPrompt: biz[0].live_call_tasks_prompt || '' };
+    if (error || !biz) return null;
+    return { liveCallTasksPrompt: biz.live_call_tasks_prompt || '' };
 }
 
 async function generateCallSummary(callerTranscript, geminiTranscript) {
@@ -274,7 +284,7 @@ async function generateCallSummary(callerTranscript, geminiTranscript) {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
-                    contents: [{ parts: [{ text: `Summarize this phone call in 3-4 bullet points. Cover what was discussed, decisions made, and next steps. Be concise and professional. Only return bullet points, no intro text.\n\nTranscript:\n${fullTranscript}` }] }],
+                    contents: [{ parts: [{ text: `Summarize this phone call in 3-4 bullet points. Cover what was discussed, decisions made, and next steps. Be concise and professional. IMPORTANT INSTRUCTION: At the very end of your response, on a new line, you MUST evaluate the human caller's sentiment and intent and append exactly one of these tags: [INTEREST: INTERESTED], [INTEREST: NOT_INTERESTED], [INTEREST: LIKELY_INTERESTED], or [INTEREST: UNKNOWN]. Only return bullet points and the tag, no intro text.\n\nTranscript:\n${fullTranscript}` }] }],
                     generationConfig: { maxOutputTokens: 300, temperature: 0.2 }
                 })
             }
@@ -291,10 +301,9 @@ fastify.get('/', async (request, reply) => {
     reply.send({ message: 'Twilio + Gemini Live API Media Stream Server is running!' });
 });
 
-// --- ENHANCED CALL STATUS CALLBACK WEBHOOK ---
+// --- GLOBAL CALL STATUS CALLBACK WEBHOOK ---
 fastify.post('/call-status', async (request, reply) => {
-    // Capture CallDuration from Twilio directly
-    const { CallSid, CallStatus, CallDuration } = request.body;
+    const { CallSid, CallStatus } = request.body;
     const { businessId, campaignId, targetNumber, contactId } = request.query;
 
     console.log(`[TWILIO STATUS PING] Call ${CallSid} received status: ${CallStatus}`);
@@ -303,26 +312,21 @@ fastify.post('/call-status', async (request, reply) => {
         .from('calls')
         .select('id, status')
         .eq('twilio_call_sid', CallSid)
-        .limit(1);
+        .maybeSingle();
 
-    if (existingCall && existingCall.length > 0) {
+    if (existingCall) {
         // If row exists, update it to the terminal Twilio status
         if (['busy', 'no-answer', 'canceled', 'failed', 'completed'].includes(CallStatus)) {
-            let updatePayload = { 
+            await supabase.from('calls').update({ 
                 status: CallStatus,
                 ended_at: new Date().toISOString()
-            };
-            // Safely capture duration if Twilio provided it
-            if (CallDuration) {
-                updatePayload.duration_seconds = parseInt(CallDuration, 10);
-                updatePayload.credits_used = Math.ceil(updatePayload.duration_seconds / 60);
-            }
-
-            await supabase.from('calls').update(updatePayload).eq('id', existingCall[0].id);
+            }).eq('id', existingCall.id);
         }
     } else {
         // Failsafe: if the initial DB insertion failed, catch it here.
         if (['busy', 'no-answer', 'canceled', 'failed', 'completed'].includes(CallStatus)) {
+            console.log(`[SYS] Logging connection drop fallback for ${targetNumber} as: ${CallStatus}`);
+            
             let cId = campaignId;
             if (!cId || cId === 'null' || cId === 'undefined') cId = null;
 
@@ -334,8 +338,8 @@ fastify.post('/call-status', async (request, reply) => {
                 direction: 'outbound',
                 status: CallStatus, 
                 twilio_call_sid: CallSid,
-                duration_seconds: CallDuration ? parseInt(CallDuration, 10) : 0,
-                credits_used: CallDuration ? Math.ceil(parseInt(CallDuration, 10) / 60) : 0,
+                duration_seconds: 0,
+                credits_used: 0,
                 started_at: new Date().toISOString(),
                 ended_at: new Date().toISOString()
             });
@@ -373,24 +377,23 @@ fastify.post('/make-call', async (request, reply) => {
         .from('businesses')
         .select('twilio_account_sid, twilio_auth_token, twilio_number, credits_balance')
         .eq('id', businessId)
-        .limit(1);
+        .maybeSingle();
 
-    if (dbError || !businessData || businessData.length === 0) {
+    if (dbError || !businessData) {
         return reply.status(500).send({ error: 'Failed to retrieve business profile.' });
     }
-    const bData = businessData[0];
 
-    if (bData.credits_balance <= 0) {
+    if (businessData.credits_balance <= 0) {
         return reply.status(402).send({ error: 'Insufficient credits. Please top up your balance.' });
     }
 
-    if (!bData.twilio_account_sid || !bData.twilio_auth_token || !bData.twilio_number) {
+    if (!businessData.twilio_account_sid || !businessData.twilio_auth_token || !businessData.twilio_number) {
         return reply.status(400).send({ error: 'Twilio credentials not configured. Please update your Settings.' });
     }
 
-    const userTwilioSid = bData.twilio_account_sid.trim();
-    const userTwilioAuth = bData.twilio_auth_token.trim();
-    const userTwilioNumber = bData.twilio_number.trim();
+    const userTwilioSid = businessData.twilio_account_sid.trim();
+    const userTwilioAuth = businessData.twilio_auth_token.trim();
+    const userTwilioNumber = businessData.twilio_number.trim();
 
     try {
         const credentials = Buffer.from(`${userTwilioSid}:${userTwilioAuth}`).toString('base64');
@@ -435,22 +438,19 @@ fastify.post('/make-call', async (request, reply) => {
             let cId = campaignId;
             if (!cId || cId === 'null' || cId === 'undefined') cId = null;
 
-            // --- INSTANT ROW CREATION SAFE SHIELD ---
-            const { data: duplicateCheck } = await supabase.from('calls').select('id').eq('twilio_call_sid', data.sid).limit(1);
-            if (!duplicateCheck || duplicateCheck.length === 0) {
-                await supabase.from('calls').insert({
-                    business_id: businessId || null,
-                    contact_id: contactId || null,
-                    campaign_id: cId,
-                    target_number: to,
-                    direction: 'outbound',
-                    status: 'initiated', 
-                    twilio_call_sid: data.sid,
-                    duration_seconds: 0,
-                    credits_used: 0,
-                    started_at: new Date().toISOString()
-                });
-            }
+            // --- INSTANT ROW CREATION ---
+            await supabase.from('calls').insert({
+                business_id: businessId || null,
+                contact_id: contactId || null,
+                campaign_id: cId,
+                target_number: to,
+                direction: 'outbound',
+                status: 'initiated', 
+                twilio_call_sid: data.sid,
+                duration_seconds: 0,
+                credits_used: 0,
+                started_at: new Date().toISOString()
+            });
 
             reply.send({ success: true, callSid: data.sid, to });
         } else {
@@ -908,9 +908,9 @@ fastify.register(async (fastify) => {
 
                         connectGemini();
 
-                        const { data: existingRecord } = await supabase.from('calls').select('id').eq('twilio_call_sid', streamSid).limit(1);
-                        if (existingRecord && existingRecord.length > 0) {
-                            callId = existingRecord[0].id;
+                        const { data: existingRecord } = await supabase.from('calls').select('id').eq('twilio_call_sid', streamSid).maybeSingle();
+                        if (existingRecord) {
+                            callId = existingRecord.id;
                             await supabase.from('calls').update({ status: 'in-progress' }).eq('id', callId);
                         } else {
                             callId = await createCallRecord({ 
