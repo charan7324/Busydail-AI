@@ -347,7 +347,7 @@ fastify.post('/call-status', async (request, reply) => {
                 twilio_call_sid: CallSid,
                 duration_seconds: CallDuration ? parseInt(CallDuration, 10) : 0,
                 credits_used: CallDuration ? Math.ceil(parseInt(CallDuration, 10) / 60) : 0,
-                started_at: new Date().toISOString(),
+                started_at: new DatetoISOString(),
                 ended_at: new Date().toISOString()
             });
         }
@@ -641,13 +641,13 @@ fastify.register(async (fastify) => {
                 isTransferring = false;
                 return;
             }
-            if (targetAgent.id === currentAgent.id) {
+            if (currentAgent && targetAgent.id === currentAgent.id) {
                 console.log(`[SYS] AI attempted to transfer to itself. Ignoring.`);
                 isTransferring = false;
                 return;
             }
 
-            console.log(`[HOT SWAP] Instantly swapping from ${currentAgent.name} to ${targetAgent.name}`);
+            console.log(`[HOT SWAP] Instantly swapping from ${currentAgent?.name} to ${targetAgent.name}`);
 
             if (geminiWs && geminiWs.readyState === WebSocket.OPEN) {
                 geminiWs.close();
@@ -684,11 +684,22 @@ fastify.register(async (fastify) => {
                 let finalPrompt = currentAgent ? currentAgent.prompt : SYSTEM_MESSAGE;
                 let finalVoice = currentAgent ? currentAgent.voice : VOICE;
 
+                finalPrompt += `\n\n=== CALL CONTEXT & AWARENESS ===\n`;
+                finalPrompt += `- CALL DIRECTION: This is an ${direction.toUpperCase()} call.\n`;
+                if (currentAgent) {
+                    finalPrompt += `- YOUR IDENTITY: You are currently acting as ${currentAgent.name}.\n`;
+                }
+
                 if (isGroupCall && availableAgents.length > 0) {
-                    finalPrompt += `\n\n=== MULTI-AGENT ROUTING RULES ===\n${groupRoutingConditions}\n\nIMPORTANT INSTRUCTION: If the user's request matches your routing rules, you MUST transfer the call. To do this, simply say a brief transition sentence (e.g., "I'll transfer you now, please hold.") and append EXACTLY this tag at the very end of your text response: [TRANSFER_TO_agent_id]\n\nAVAILABLE AGENTS & EXACT TAGS TO USE:\n`;
+                    finalPrompt += `\n=== MULTI-AGENT ROUTING RULES ===\n${groupRoutingConditions}\n\nIMPORTANT INSTRUCTION: If the user's request matches your routing rules to transfer, you MUST transfer the call. \nCRITICAL IDENTITY RULE: You are currently acting as ${currentAgent ? currentAgent.name : 'this agent'}. You CANNOT transfer the call to yourself. If the user asks for you or your department, handle it directly.\n\nTo transfer to a DIFFERENT agent, simply say a brief transition sentence (e.g., "I'll transfer you now, please hold.") and append EXACTLY this tag at the very end of your text response: [TRANSFER_TO_agent_id]\n\nAVAILABLE AGENTS & EXACT TAGS TO USE:\n`;
+                    let hasOtherAgents = false;
                     availableAgents.forEach(a => {
-                        finalPrompt += `- To transfer to ${a.name}, use tag: [TRANSFER_TO_${a.id}]\n`;
+                        if (!currentAgent || String(a.id) !== String(currentAgent.id)) {
+                            finalPrompt += `- To transfer to ${a.name}, use tag: [TRANSFER_TO_${a.id}]\n`;
+                            hasOtherAgents = true;
+                        }
                     });
+                    if (!hasOtherAgents) { finalPrompt += `- (No other agents currently available to transfer to)\n`; }
                 }
 
                 finalPrompt += `\n\nAdditionally follow these natural conversation rules:\n- Use natural fillers: "hmm...", "uh...", "okay..."\n- Keep responses VERY SHORT — 1-2 sentences max\n- If user is silent: "hello... are you there?"\n- If user wants to end call: say a warm goodbye and append [END_CALL] at the very end of your text response\n- The [END_CALL] tag is never spoken — it is only a signal`;
@@ -735,8 +746,12 @@ fastify.register(async (fastify) => {
                             geminiWs.send(JSON.stringify(transferMsg));
                             isTransferContextActive = false;
                         } else {
+                            let greetingText = direction === 'outbound' 
+                                ? '[INTERNAL SYSTEM: The call just connected. YOU called the user (OUTBOUND). Greet them naturally, state who you are, and immediately say why you are calling based on your persona. DO NOT say "how may I help you?". Keep it very brief.]'
+                                : '[INTERNAL SYSTEM: The call just connected. The user called YOU (INBOUND). Greet them with a short, friendly welcome and ask how you can help.]';
+                            
                             geminiWs.send(JSON.stringify({
-                                client_content: { turns: [{ role: 'user', parts: [{ text: 'Greet the user with a short, friendly welcome message and ask how you can help.' }] }], turn_complete: true }
+                                client_content: { turns: [{ role: 'user', parts: [{ text: greetingText }] }], turn_complete: true }
                             }));
                         }
                         return;
