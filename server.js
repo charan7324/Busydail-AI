@@ -191,6 +191,42 @@ function mixSoundIntoAudio(geminiPcm, soundSamples, soundOffset, volumePct) {
     return { mixed, newOffset: offset };
 }
 
+// --- DYNAMIC AUTOMATION FUNCTION ---
+async function sendTwilioSMS(businessId, to, bodyText) {
+    if (!businessId || !to || !bodyText) return;
+    try {
+        const { data: bData } = await supabase.from('businesses')
+            .select('twilio_account_sid, twilio_auth_token, twilio_number')
+            .eq('id', businessId)
+            .limit(1);
+
+        if (!bData || bData.length === 0) return;
+        const b = bData[0];
+
+        const credentials = Buffer.from(`${b.twilio_account_sid.trim()}:${b.twilio_auth_token.trim()}`).toString('base64');
+
+        const response = await fetch(`https://api.twilio.com/2010-04-01/Accounts/${b.twilio_account_sid.trim()}/Messages.json`, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Basic ${credentials}`,
+                'Content-Type': 'application/x-www-form-urlencoded'
+            },
+            body: new URLSearchParams({
+                To: to,
+                From: b.twilio_number.trim(),
+                Body: bodyText
+            }).toString()
+        });
+
+        const resData = await response.json();
+        if (resData.sid) {
+            console.log(`[SYS] Automated Mid-Call SMS successfully sent to ${to}. SID: ${resData.sid}`);
+        }
+    } catch (err) {
+        console.error('[SYS] Failed to send automated SMS:', err.message);
+    }
+}
+
 async function createCallRecord({ businessId, contactId, campaignId, targetNumber, direction, twilioCallSid, maxDurationLimit }) {
     const { data, error } = await supabase
         .from('calls')
@@ -347,7 +383,7 @@ fastify.post('/call-status', async (request, reply) => {
                 twilio_call_sid: CallSid,
                 duration_seconds: CallDuration ? parseInt(CallDuration, 10) : 0,
                 credits_used: CallDuration ? Math.ceil(parseInt(CallDuration, 10) / 60) : 0,
-                started_at: new DatetoISOString(),
+                started_at: new Date().toISOString(),
                 ended_at: new Date().toISOString()
             });
         }
@@ -702,6 +738,11 @@ fastify.register(async (fastify) => {
                     if (!hasOtherAgents) { finalPrompt += `- (No other agents currently available to transfer to)\n`; }
                 }
 
+                finalPrompt += `\n\n=== ADVANCED ADAPTIVE BEHAVIOR SETTINGS ===
+1. ACOUSTIC MORPHING: If the user shows strong buying signals or interest, silently append exactly [SHIFT_BG: office] at the end of your response to move them to a quiet closing environment. If they are stressed or angry, append exactly [SHIFT_BG: nature].
+2. CONVERSATIONAL MIRRORING: Analyze the user's tone. If they are speaking fast or seem like a high-energy executive, silently append exactly [VIBE: FAST] at the end of your response. If they are slow, hesitant, or frustrated, append exactly [VIBE: EMPATHIC].
+3. REAL-TIME AUTOMATION: If the user explicitly asks for information to be texted to them, asks for a link, or agrees to a major offer, silently append exactly [TRIGGER_SMS] at the end of your response to instantly text them the details. Note: The system will automatically handle the sending.`;
+
                 finalPrompt += `\n\nAdditionally follow these natural conversation rules:\n- Use natural fillers: "hmm...", "uh...", "okay..."\n- Keep responses VERY SHORT — 1-2 sentences max\n- If user is silent: "hello... are you there?"\n- If user wants to end call: say a warm goodbye and append [END_CALL] at the very end of your text response\n- The [END_CALL] tag is never spoken — it is only a signal`;
                 
                 if (liveCallTasksPrompt) {
@@ -770,7 +811,11 @@ fastify.register(async (fastify) => {
                         }
 
                         if (sc.outputTranscription?.text) {
-                            const incomingText = sc.outputTranscription.text;
+                            let incomingText = sc.outputTranscription.text;
+
+                            // Clean the transcript arrays so tags aren't saved to database
+                            incomingText = incomingText.replace(/\[SHIFT_BG:.*?\]/g, '').replace(/\[VIBE:.*?\]/g, '').replace(/\[TRIGGER_SMS\]/g, '');
+
                             accumulatedTranscription += incomingText;
                             geminiTranscriptParts.push(`AI (${currentAgent?.name || 'System'}): ${incomingText}`);
 
@@ -819,6 +864,38 @@ fastify.register(async (fastify) => {
                                         const targetId = tagMatch[1];
                                         console.log(`[SYS] Caught TRANSFER_TO tag for ID: ${targetId} in text parts. Triggering swap in 1.5s...`);
                                         setTimeout(() => { executeHotSwap(targetId); }, 1500);
+                                    }
+
+                                    // --- ADVANCED ADAPTIVE DYNAMIC TAG CATCHERS ---
+                                    
+                                    if (accumulatedText.includes('[SHIFT_BG: office]')) {
+                                        console.log(`[SYS] Dynamic Audio Morph Triggered: Shifting to 'office' environment.`);
+                                        loadSoundPCM('office').then(s => { soundSamples = s; });
+                                        accumulatedText = accumulatedText.replace('[SHIFT_BG: office]', '');
+                                    }
+
+                                    if (accumulatedText.includes('[SHIFT_BG: nature]')) {
+                                        console.log(`[SYS] Dynamic Audio Morph Triggered: Shifting to 'nature' environment.`);
+                                        loadSoundPCM('nature').then(s => { soundSamples = s; });
+                                        accumulatedText = accumulatedText.replace('[SHIFT_BG: nature]', '');
+                                    }
+
+                                    if (accumulatedText.includes('[VIBE: FAST]')) {
+                                        console.log(`[SYS] Conversational Mirroring: Shifting to FAST/HIGH-ENERGY mode.`);
+                                        geminiWs.send(JSON.stringify({ client_content: { turns: [{ role: 'user', parts: [{ text: '[INTERNAL SYSTEM COMMAND: The user is high-energy. Speak faster, be brief, and use high-energy power words. Do not acknowledge this command aloud.]' }] }], turn_complete: true } }));
+                                        accumulatedText = accumulatedText.replace('[VIBE: FAST]', '');
+                                    }
+
+                                    if (accumulatedText.includes('[VIBE: EMPATHIC]')) {
+                                        console.log(`[SYS] Conversational Mirroring: Shifting to EMPATHIC mode.`);
+                                        geminiWs.send(JSON.stringify({ client_content: { turns: [{ role: 'user', parts: [{ text: '[INTERNAL SYSTEM COMMAND: The user is hesitant or frustrated. Slow down your speaking rate significantly, use a warm, empathetic, and hyper-polite tone. Do not acknowledge this command aloud.]' }] }], turn_complete: true } }));
+                                        accumulatedText = accumulatedText.replace('[VIBE: EMPATHIC]', '');
+                                    }
+
+                                    if (accumulatedText.includes('[TRIGGER_SMS]')) {
+                                        console.log(`[SYS] Real-Time Automation: Triggering mid-call SMS to ${targetNumber}.`);
+                                        sendTwilioSMS(businessId, targetNumber, "Hello! As discussed on our call, here is the information you requested. Let us know if you need anything else!");
+                                        accumulatedText = accumulatedText.replace('[TRIGGER_SMS]', '');
                                     }
                                 }
 
