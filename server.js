@@ -191,19 +191,37 @@ function mixSoundIntoAudio(geminiPcm, soundSamples, soundOffset, volumePct) {
     return { mixed, newOffset: offset };
 }
 
-// --- DYNAMIC AUTOMATION FUNCTION ---
-async function sendTwilioSMS(businessId, to, bodyText) {
-    if (!businessId || !to || !bodyText) return;
+// --- FULLY INTEGRATED SMS AUTOMATION FUNCTION ---
+async function sendTwilioSMS(businessId, to) {
+    if (!businessId || !to) return;
     try {
+        // Fetch SMS settings specific to this business
         const { data: bData } = await supabase.from('businesses')
-            .select('twilio_account_sid, twilio_auth_token, twilio_number')
+            .select('twilio_account_sid, twilio_auth_token, twilio_number, sms_automation_enabled, sms_automation_text, sms_automation_media_url')
             .eq('id', businessId)
             .limit(1);
 
         if (!bData || bData.length === 0) return;
         const b = bData[0];
 
+        // Ensure automation is actually turned on and text exists
+        if (!b.sms_automation_enabled || !b.sms_automation_text || b.sms_automation_text.trim() === '') {
+            console.log(`[SYS] Automation disabled or empty text. SMS aborted.`);
+            return;
+        }
+
         const credentials = Buffer.from(`${b.twilio_account_sid.trim()}:${b.twilio_auth_token.trim()}`).toString('base64');
+        
+        const payload = new URLSearchParams({
+            To: to,
+            From: b.twilio_number.trim(),
+            Body: b.sms_automation_text.trim()
+        });
+
+        // Attach media URL if it exists
+        if (b.sms_automation_media_url && b.sms_automation_media_url.trim() !== '') {
+            payload.append('MediaUrl', b.sms_automation_media_url.trim());
+        }
 
         const response = await fetch(`https://api.twilio.com/2010-04-01/Accounts/${b.twilio_account_sid.trim()}/Messages.json`, {
             method: 'POST',
@@ -211,16 +229,14 @@ async function sendTwilioSMS(businessId, to, bodyText) {
                 'Authorization': `Basic ${credentials}`,
                 'Content-Type': 'application/x-www-form-urlencoded'
             },
-            body: new URLSearchParams({
-                To: to,
-                From: b.twilio_number.trim(),
-                Body: bodyText
-            }).toString()
+            body: payload.toString()
         });
 
         const resData = await response.json();
         if (resData.sid) {
             console.log(`[SYS] Automated Mid-Call SMS successfully sent to ${to}. SID: ${resData.sid}`);
+        } else {
+            console.error(`[SYS] Twilio SMS Failure. Reason:`, resData.message);
         }
     } catch (err) {
         console.error('[SYS] Failed to send automated SMS:', err.message);
@@ -339,7 +355,6 @@ fastify.get('/', async (request, reply) => {
     reply.send({ message: 'Twilio + Gemini Live API Media Stream Server is running!' });
 });
 
-// --- ENHANCED CALL STATUS CALLBACK WEBHOOK ---
 fastify.post('/call-status', async (request, reply) => {
     const { CallSid, CallStatus, CallDuration } = request.body;
     const { businessId, campaignId, targetNumber, contactId } = request.query;
@@ -353,22 +368,18 @@ fastify.post('/call-status', async (request, reply) => {
         .limit(1);
 
     if (existingCall && existingCall.length > 0) {
-        // If row exists, update it to the terminal Twilio status
         if (['busy', 'no-answer', 'canceled', 'failed', 'completed'].includes(CallStatus)) {
             let updatePayload = { 
                 status: CallStatus,
                 ended_at: new Date().toISOString()
             };
-            // Safely capture duration if Twilio provided it
             if (CallDuration) {
                 updatePayload.duration_seconds = parseInt(CallDuration, 10);
                 updatePayload.credits_used = Math.ceil(updatePayload.duration_seconds / 60);
             }
-
             await supabase.from('calls').update(updatePayload).eq('id', existingCall[0].id);
         }
     } else {
-        // Failsafe: if the initial DB insertion failed, catch it here.
         if (['busy', 'no-answer', 'canceled', 'failed', 'completed'].includes(CallStatus)) {
             let cId = campaignId;
             if (!cId || cId === 'null' || cId === 'undefined') cId = null;
@@ -482,7 +493,6 @@ fastify.post('/make-call', async (request, reply) => {
             let cId = campaignId;
             if (!cId || cId === 'null' || cId === 'undefined') cId = null;
 
-            // --- INSTANT ROW CREATION SAFE SHIELD ---
             const { data: duplicateCheck } = await supabase.from('calls').select('id').eq('twilio_call_sid', data.sid).limit(1);
             if (!duplicateCheck || duplicateCheck.length === 0) {
                 await supabase.from('calls').insert({
@@ -498,7 +508,6 @@ fastify.post('/make-call', async (request, reply) => {
                     started_at: new Date().toISOString()
                 });
             }
-
             reply.send({ success: true, callSid: data.sid, to });
         } else {
             reply.status(500).send({ success: false, error: data.message || 'Failed to initiate call via your Twilio account' });
@@ -551,6 +560,7 @@ fastify.register(async (fastify) => {
 
         let liveCallTasksPrompt = '';
         let capturedExtractedData = null;
+        let hasSentSMS = false; // Prevents SMS spam during a single call
 
         const endCall = async (reason = 'timeout') => {
             if (callEnded) return;
@@ -738,10 +748,11 @@ fastify.register(async (fastify) => {
                     if (!hasOtherAgents) { finalPrompt += `- (No other agents currently available to transfer to)\n`; }
                 }
 
+                // Updated instructions to catch BOTH interested and likelyinterested states
                 finalPrompt += `\n\n=== ADVANCED ADAPTIVE BEHAVIOR SETTINGS ===
 1. ACOUSTIC MORPHING: If the user shows strong buying signals or interest, silently append exactly [SHIFT_BG: office] at the end of your response to move them to a quiet closing environment. If they are stressed or angry, append exactly [SHIFT_BG: nature].
 2. CONVERSATIONAL MIRRORING: Analyze the user's tone. If they are speaking fast or seem like a high-energy executive, silently append exactly [VIBE: FAST] at the end of your response. If they are slow, hesitant, or frustrated, append exactly [VIBE: EMPATHIC].
-3. REAL-TIME AUTOMATION: If the user explicitly asks for information to be texted to them, asks for a link, or agrees to a major offer, silently append exactly [TRIGGER_SMS] at the end of your response to instantly text them the details. Note: The system will automatically handle the sending.`;
+3. REAL-TIME AUTOMATION: If the user shows high interest, asks for a callback, requests more information, or agrees to an offer (i.e., they are 'interested' or 'likely interested'), silently append exactly [TRIGGER_SMS] at the end of your response to instantly text them the details. Note: The system will automatically handle the sending.`;
 
                 finalPrompt += `\n\nAdditionally follow these natural conversation rules:\n- Use natural fillers: "hmm...", "uh...", "okay..."\n- Keep responses VERY SHORT — 1-2 sentences max\n- If user is silent: "hello... are you there?"\n- If user wants to end call: say a warm goodbye and append [END_CALL] at the very end of your text response\n- The [END_CALL] tag is never spoken — it is only a signal`;
                 
@@ -813,7 +824,6 @@ fastify.register(async (fastify) => {
                         if (sc.outputTranscription?.text) {
                             let incomingText = sc.outputTranscription.text;
 
-                            // Clean the transcript arrays so tags aren't saved to database
                             incomingText = incomingText.replace(/\[SHIFT_BG:.*?\]/g, '').replace(/\[VIBE:.*?\]/g, '').replace(/\[TRIGGER_SMS\]/g, '');
 
                             accumulatedTranscription += incomingText;
@@ -893,8 +903,11 @@ fastify.register(async (fastify) => {
                                     }
 
                                     if (accumulatedText.includes('[TRIGGER_SMS]')) {
-                                        console.log(`[SYS] Real-Time Automation: Triggering mid-call SMS to ${targetNumber}.`);
-                                        sendTwilioSMS(businessId, targetNumber, "Hello! As discussed on our call, here is the information you requested. Let us know if you need anything else!");
+                                        if (!hasSentSMS) {
+                                            console.log(`[SYS] Real-Time Automation: Triggering mid-call SMS to ${targetNumber}.`);
+                                            sendTwilioSMS(businessId, targetNumber);
+                                            hasSentSMS = true; // Prevent spamming duplicate texts on same call
+                                        }
                                         accumulatedText = accumulatedText.replace('[TRIGGER_SMS]', '');
                                     }
                                 }
